@@ -1,0 +1,88 @@
+# Ground Region Tracker — default configuration for Jetson Orin Nano
+
+app:
+  name: "Ground Region Tracker"
+  version: "1.0.0"
+  language: "en"  # en | fa
+  headless: false
+
+paths:
+  models_dir: "models"
+  output_dir: "data/output"
+  failed_frames_dir: "data/failed_frames"
+  projects_dir: "data/projects"
+  logs_dir: "logs"
+  input_dir: "data/input"
+
+video:
+  prefer_gstreamer: true
+  skip_frames: 0
+  start_frame: 0
+  end_frame: -1  # -1 = last frame
+
+tracking:
+  mode: "hybrid"  # manual | yolo | hybrid
+  tracker_type: "optical_flow"  # csrt | kcf | optical_flow | homography
+  feature_detector: "AKAZE"  # AKAZE | ORB
+  max_features: 2000
+  keyframe_interval: 15
+  feature_match_interval: 5
+  lowe_ratio: 0.75
+  min_inliers: 12
+  max_reprojection_error: 4.0
+  min_scale: 0.15
+  max_scale: 8.0
+  max_area_change: 4.0
+  lost_frames_threshold: 15
+  confidence_threshold: 0.45
+  low_confidence_threshold: 0.30
+
+yolo:
+  enabled: true
+  mode: "detection"  # detection | segmentation
+  model_path: "models/best.engine"
+  fallback_model_path: "models/best.onnx"
+  pytorch_model_path: "models/best.pt"
+  target_class: 0
+  class_names: ["ground_region"]
+  confidence_threshold: 0.45
+  iou_threshold: 0.45
+  every_n_frames: 30
+  imgsz: 640
+  device: "cuda"  # cuda | cpu | tensorrt
+  use_fp16: true
+  use_int8: false
+  warmup_iterations: 5
+
+smoothing:
+  enabled: true
+  method: "ema"  # ema | kalman
+  ema_alpha: 0.35
+  max_center_jump_px: 80.0
+  max_scale_jump: 0.35
+
+export:
+  save_annotated_video: true
+  save_csv: true
+  save_json: true
+  save_failed_frames: true
+  save_roi_crops: false
+  save_center_path: true
+  video_codec: "mp4v"
+  draw_trail: true
+  trail_length: 60
+
+gui:
+  window_width: 1400
+  window_height: 900
+  overlay_polygon: true
+  overlay_bbox: true
+  overlay_center: true
+  overlay_trail: true
+  overlay_status: true
+
+logging:
+  level: "INFO"
+  file: "logs/app.log"
+  max_bytes: 5242880
+  backup_count: 3

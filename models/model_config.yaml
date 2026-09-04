@@ -1,0 +1,21 @@
+# Model configuration for Ground Region Tracker
+
+model:
+  name: ground_region
+  task: detect  # detect | segment
+  classes:
+    - ground_region
+  preferred_runtime: tensorrt  # tensorrt | onnx | pytorch
+  imgsz: 640
+  fp16: true
+  int8: false
+
+files:
+  pytorch: best.pt
+  onnx: best.onnx
+  engine: best.engine
+
+notes: |
+  Place trained weights in this folder.
+  Build TensorRT engine ON the Jetson device that will run inference.
+  Engines are not portable across GPU architectures / JetPack versions.
