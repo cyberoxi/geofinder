@@ -1,0 +1,16 @@
+{
+  "manifest.json": "dc37179f970563fb3de159858634ff1979e3f6e51955a57652fa73c4c462757d",
+  "README_DEPLOYMENT.md": "d86d76a68ae9d70d054f871542b7b3a72b99669cbaa674c0585ebecd5378e2f2",
+  "config/runtime.yaml": "8ddeca4c0c6cb9f6a96bc249d063025e6bfe9c810657bd641db664bd3888e55b",
+  "reference/descriptors.npz": "2369855a313dbed41f307b10bd6df41d15211a28a7fd32e6084a8276bde48494",
+  "reference/reference_image.jpg": "35a4d9edec67462b188f75e4866f9fecbb287637dd9ff0791a0c56c50eab7af7",
+  "reference/color_hist.npy": "b087b453d474ebbf03dd8350b8f38187fada17e679ad21eb68a62cd47e62e825",
+  "reference/roi_mask.png": "780475928a7b1cf2a6b62b53756ea344a26dfc1a6aae2f0b6d8d4537b624cb76",
+  "labels/classes.txt": "d52da94e5a3da4c3ca26cfa38f19bff2388f17e6b11d59148dea0ebcd0331148",
+  "reference/templates/template_1.25.jpg": "b8d9d3aa928524880adc3101eca63024b7e08a125f02a6a47902e9cf5a282cc6",
+  "reference/templates/template_0.75.jpg": "e342baf70c8ea8a77083925d5453a225d8ea89070eb5e89d43fb002899de13d7",
+  "reference/templates/template_1.50.jpg": "bcb9df100e65f35819afbba60313b944563dc484a6c2870b4a8fb9ddb14d9ef5",
+  "reference/templates/template_1.00.jpg": "fa07ca9f3ee8d889f1890b20c7066778e19e3b5e933bdf5f33c440a566abbc1d",
+  "reference/templates/template_0.50.jpg": "90656730413287938bc9c18a0dcd9800d10c43c79596bac56b1d63a08065b5a6",
+  "reference/templates/template_2.00.jpg": "8cde7da1b48260bfef89ea378b237bc94ee5826d08246efc69123b0e12ca572a"
+}

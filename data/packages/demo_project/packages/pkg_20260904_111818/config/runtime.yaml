@@ -1,0 +1,44 @@
+export:
+  save_annotated_video: true
+  save_csv: true
+  save_failed_frames: true
+  save_json: true
+  trail_length: 60
+  video_codec: mp4v
+smoothing:
+  ema_alpha: 0.35
+  enabled: true
+  max_center_jump_px: 80.0
+  method: ema
+tracking:
+  adaptive_skip: true
+  confidence_threshold: 0.45
+  feature_detector: AKAZE
+  feature_match_interval: 5
+  keyframe_interval: 15
+  lost_frames_threshold: 15
+  low_confidence_threshold: 0.3
+  lowe_ratio: 0.75
+  max_area_change: 4.0
+  max_features: 2000
+  max_reprojection_error: 4.0
+  max_scale: 8.0
+  max_scale_jump: 0.35
+  min_inliers: 12
+  min_iou: 0.2
+  min_scale: 0.15
+  mode: hybrid
+  target_fps: 15.0
+  tracker_type: optical_flow
+  yolo_every_n_frames: 30
+yolo:
+  device: cuda
+  imgsz: 640
+  mode: segmentation
+  model_path: model/best.pt
+  multi_scale_factors:
+  - 0.75
+  - 1.0
+  - 1.25
+  use_fp16: true
+  warmup_iterations: 5

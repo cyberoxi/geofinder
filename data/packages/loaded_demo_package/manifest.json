@@ -1,0 +1,60 @@
+{
+  "project_name": "demo_zoom",
+  "target_class": "target_region",
+  "model_type": "segmentation",
+  "model_format": "none",
+  "input_size": 640,
+  "reference_roi": {
+    "points": [
+      [
+        40.0,
+        30.0
+      ],
+      [
+        120.0,
+        30.0
+      ],
+      [
+        120.0,
+        110.0
+      ],
+      [
+        40.0,
+        110.0
+      ]
+    ],
+    "width": 640,
+    "height": 480,
+    "frame_id": 0,
+    "video_id": "ba03866cede2",
+    "num_keypoints": 63,
+    "bbox": [
+      40.0,
+      30.0,
+      80.0,
+      80.0
+    ],
+    "aspect": 1.0,
+    "area": 6400.0,
+    "scales": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5,
+      2.0
+    ],
+    "feature_method": "AKAZE"
+  },
+  "feature_method": "AKAZE",
+  "min_confidence": 0.45,
+  "min_iou": 0.2,
+  "created_at": "2026-09-04T11:18:18.602165+00:00",
+  "package_version": "1.0.0",
+  "class_names": [
+    "target_region"
+  ],
+  "has_engine": false,
+  "has_onnx": false,
+  "has_pytorch": false
+}
