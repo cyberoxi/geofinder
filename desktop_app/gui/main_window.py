@@ -55,9 +55,25 @@ from shared.video_reader import VideoReader
 from desktop_app.annotation.interpolate import confirm_interpolated, interpolate_between_keyframes
 from desktop_app.dataset.builder import DatasetBuilder
 from desktop_app.packaging.builder import PackageBuilder, validate_package
-from desktop_app.pipeline.auto import AutoPipeline, AutoPipelineConfig
+from desktop_app.pipeline.auto import AutoPipeline, AutoPipelineConfig, gpu_name, torch_cuda_ok
 from desktop_app.project_manager.manager import ProjectManager
-from desktop_app.satellite import generate_satellite_videos
+from desktop_app.satellite import (
+    generate_satellite_videos,
+    load_prepared_scene,
+    prepare_scene,
+    prepare_scene_from_image,
+    read_world_file_mpp,
+    render_scene_videos,
+)
+from desktop_app.satellite.tiles import (
+    list_wayback_releases,
+    mosaic_layers,
+    pick_wayback_dates,
+    register_custom_layer,
+    register_wayback_layer,
+)
+from desktop_app.satellite.objects import sam_available
+from desktop_app.gui.landmark_editor import LandmarkEditorDialog, TargetPickerDialog
 from desktop_app.satellite.map_widget import SatelliteMapPanel
 from desktop_app.training.trainer import TrainingRunner
 
@@ -107,6 +123,32 @@ class SatelliteVideoDialog(QDialog):
         jump_row.addWidget(btn_go)
         form.addRow("Jump lat/lon", jump_row)
 
+        # Imagery source
+        self.source = QComboBox()
+        for key, title in mosaic_layers().items():
+            self.source.addItem(title, key)
+        self.source.addItem("Esri Wayback — choose a date…", "__wayback__")
+        self.source.addItem("Custom XYZ tile URL…", "__custom__")
+        self.source.addItem("My own satellite image file…", "__image__")
+        self.source.currentIndexChanged.connect(self._on_source_changed)
+        form.addRow("Imagery / تصویر", self.source)
+        self.wayback_date = QComboBox()
+        self.wayback_date.setVisible(False)
+        form.addRow("", self.wayback_date)
+        self.custom_url = QLineEdit()
+        self.custom_url.setPlaceholderText("https://server/tiles/{z}/{x}/{y}.jpg")
+        self.custom_url.setVisible(False)
+        form.addRow("", self.custom_url)
+        self.extra_dates = QSpinBox()
+        self.extra_dates.setRange(0, 6)
+        self.extra_dates.setValue(2)
+        self.extra_dates.setToolTip(
+            "Also download the same area from N other Esri Wayback dates (other seasons / years) "
+            "and train on them too — same labels, different appearance."
+        )
+        form.addRow("Extra dates (seasons)", self.extra_dates)
+        self._wayback: List[dict] = []
+
         self.tile_zoom = QSpinBox()
         self.tile_zoom.setRange(12, 19)
         self.tile_zoom.setValue(17)
@@ -114,8 +156,8 @@ class SatelliteVideoDialog(QDialog):
         form.addRow("Download zoom", self.tile_zoom)
 
         self.zoom_out = QSpinBox()
-        self.zoom_out.setRange(4, 24)
-        self.zoom_out.setValue(12)
+        self.zoom_out.setRange(4, 40)
+        self.zoom_out.setValue(20)
         self.zoom_out.setToolTip(
             "How many times wider the video starts vs your selection. "
             "Higher = starts more zoomed out, then flies into the box."
@@ -146,8 +188,8 @@ class SatelliteVideoDialog(QDialog):
         form.addRow(self.auto_label)
 
         self.n_landmarks = QSpinBox()
-        self.n_landmarks.setRange(0, 8)
-        self.n_landmarks.setValue(4)
+        self.n_landmarks.setRange(0, 20)
+        self.n_landmarks.setValue(8)
         self.n_landmarks.setToolTip(
             "Distinctive objects around the target found automatically. The model learns them too, "
             "so the target can be located from its surroundings when it is small or out of view."
@@ -159,6 +201,29 @@ class SatelliteVideoDialog(QDialog):
         self.n_videos.setValue(6)
         self.n_videos.setToolTip("Varied clips: rotated/off-centre zooms, low passes, lighting changes")
         form.addRow("Training videos", self.n_videos)
+
+        self.use_sam = QCheckBox("Detect real objects with FastSAM")
+        self.use_sam.setChecked(sam_available())
+        self.use_sam.setEnabled(sam_available())
+        self.use_sam.setToolTip("Needs FastSAM-s.pt in the project folder; otherwise colour/texture detection is used")
+        form.addRow(self.use_sam)
+
+        self.review = QCheckBox("Review / edit landmarks before building videos")
+        self.review.setChecked(True)
+        form.addRow(self.review)
+
+        self.night_pct = QSpinBox()
+        self.night_pct.setRange(0, 80)
+        self.night_pct.setValue(25)
+        self.night_pct.setSuffix(" %")
+        self.night_pct.setToolTip("Share of training videos rendered as simulated night (streetlights, low light, noise)")
+        form.addRow("Night videos / شب", self.night_pct)
+        self.ir_pct = QSpinBox()
+        self.ir_pct.setRange(0, 60)
+        self.ir_pct.setValue(15)
+        self.ir_pct.setSuffix(" %")
+        self.ir_pct.setToolTip("Share rendered as thermal-like (IR) imagery — for night cameras with IR/thermal sensors")
+        form.addRow("Thermal / IR videos", self.ir_pct)
 
         self.run_pipeline = QCheckBox("Then run full pipeline (dataset → train → ONNX → package)")
         self.run_pipeline.setChecked(True)
@@ -223,14 +288,130 @@ class SatelliteVideoDialog(QDialog):
             self.auto_label,
             self.n_landmarks,
             self.n_videos,
+            self.source,
+            self.wayback_date,
+            self.custom_url,
+            self.extra_dates,
+            self.night_pct,
+            self.ir_pct,
+            self.use_sam,
+            self.review,
             self.run_pipeline,
             self.btn_generate,
             self.map_panel,
         ):
             w.setEnabled(enabled)
 
+    # ---- imagery source
+    def _on_source_changed(self, _i: int = 0) -> None:
+        src = self.source.currentData()
+        self.wayback_date.setVisible(src == "__wayback__")
+        self.custom_url.setVisible(src == "__custom__")
+        if src == "__wayback__" and self.wayback_date.count() == 0:
+            self.progress_label.setText("Loading Wayback archive dates…")
+            QApplication.processEvents()
+            self._wayback = list_wayback_releases(Path("data") / "satellite_cache")
+            for r in self._wayback:
+                self.wayback_date.addItem(r["date"], r["id"])
+            self.progress_label.setText(f"{len(self._wayback)} imagery dates available" if self._wayback else "Wayback unavailable (offline?)")
+        key = self._layer_key(preview_only=True)
+        if key:
+            try:
+                self.map_panel.map.set_basemap(key)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _layer_key(self, preview_only: bool = False) -> Optional[str]:
+        src = self.source.currentData()
+        if src == "__wayback__":
+            rid = self.wayback_date.currentData()
+            rel = next((r for r in self._wayback if r["id"] == rid), None)
+            return register_wayback_layer(rel) if rel else None
+        if src == "__custom__":
+            url = self.custom_url.text().strip()
+            if not url:
+                return None
+            try:
+                return register_custom_layer(url)
+            except ValueError as exc:
+                if not preview_only:
+                    QMessageBox.warning(self, "Custom source", str(exc))
+                return None
+        if src == "__image__":
+            return None
+        return src
+
+    def _extra_layers(self, primary: Optional[str]) -> List[str]:
+        n = self.extra_dates.value()
+        if n <= 0:
+            return []
+        if not self._wayback:
+            self._wayback = list_wayback_releases(Path("data") / "satellite_cache")
+        return [register_wayback_layer(r) for r in pick_wayback_dates(self._wayback, n, exclude_key=primary or "")]
+
+    def _start_own_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Satellite / aerial image", "", "Images (*.tif *.tiff *.jpg *.jpeg *.png *.bmp)"
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            QMessageBox.critical(self, "Image", f"Cannot read {path}")
+            return
+        mpp = read_world_file_mpp(path)
+        from shared.qt_compat import QInputDialog
+
+        mpp, ok = QInputDialog.getDouble(
+            self,
+            "Ground resolution",
+            "Metres per pixel (ground sample distance) of this image:\n"
+            "(read from the world file when present; e.g. 0.3–1.0 for high-res satellites)",
+            float(mpp or 0.5),
+            0.01,
+            100.0,
+            3,
+        )
+        if not ok:
+            return
+        picker = TargetPickerDialog(img, self)
+        if qt_exec(picker) != QDialog.Accepted:
+            return
+        params = self.params(require_map=False)
+        self._params = params
+        rect = picker.rect
+        out_dir = self.out_dir
+        self._busy = True
+        self._set_controls_enabled(False)
+
+        def job(progress, frame):
+            return prepare_scene_from_image(
+                img,
+                rect,
+                meters_per_px=mpp,
+                out_dir=out_dir,
+                num_landmarks=params["num_landmarks"],
+                use_sam=params["use_sam"],
+                source_name=Path(path).name,
+                progress_cb=progress,
+                frame_cb=frame,
+            )
+
+        self._worker = StageWorker(job)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.finished_ok.connect(self._on_prepared)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.start()
+
     def _try_accept(self) -> None:
         if self._busy:
+            return
+        if self.source.currentData() == "__image__":
+            if not self.auto_label.isChecked():
+                QMessageBox.warning(self, "Own image", "Own images require 'Auto-label target + landmarks'.")
+                return
+            self._start_own_image()
             return
         if not self.map_panel.map.selection_bbox():
             QMessageBox.warning(
@@ -256,7 +437,94 @@ class SatelliteVideoDialog(QDialog):
         self.preview.setText("Downloading…")
         self.btn_cancel.setText("Cancel")
 
-        self._worker = SatelliteWorker(self.params(), self.out_dir)
+        params = self.params()
+        if params["auto_label"]:
+            self._start_prepare(params)
+            return
+        self._worker = SatelliteWorker(params, self.out_dir)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.finished_ok.connect(self._on_worker_done)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.start()
+
+    # ---- auto-label flow: prepare (imagery + landmarks) → review → render
+    def _start_prepare(self, params: Dict[str, Any]) -> None:
+        out_dir = self.out_dir
+        layer = self._layer_key() or "satellite"
+        extra = self._extra_layers(layer)
+
+        def job(progress, frame):
+            return prepare_scene(
+                south=params["south"],
+                west=params["west"],
+                north=params["north"],
+                east=params["east"],
+                zoom=params["zoom"],
+                zoom_out_factor=params["zoom_out_factor"],
+                out_dir=out_dir,
+                cache_dir=Path("data") / "satellite_cache",
+                num_landmarks=params["num_landmarks"],
+                use_sam=params["use_sam"],
+                layer=layer,
+                extra_layers=extra,
+                progress_cb=progress,
+                frame_cb=frame,
+            )
+
+        self._params = params
+        self._worker = StageWorker(job)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.frame_ready.connect(self._on_frame)
+        self._worker.finished_ok.connect(self._on_prepared)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.start()
+
+    def _on_prepared(self, prepared: object) -> None:
+        if not self._busy:
+            return
+        layout = prepared.layout
+        if self._params.get("review"):
+            dlg = LandmarkEditorDialog(
+                prepared.mosaic, layout, prepared.candidates, self,
+                extra_mosaics=prepared.extra_mosaics, extra_masks=prepared.extra_masks,
+            )
+            if qt_exec(dlg) != QDialog.Accepted:
+                self._busy = False
+                self._set_controls_enabled(True)
+                self.progress_label.setText("Cancelled at landmark review")
+                return
+            layout = dlg.result_layout()
+            prepared.candidates = dlg.result_candidates()
+            prepared.extra_mosaics, prepared.extra_masks = dlg.result_extras()
+            from desktop_app.satellite.scene import save_candidates
+
+            save_candidates(prepared.candidates_path, prepared.candidates)
+        prepared.save_layout(layout)
+        prepared.save_extras()
+        self._on_frame(cv2.imread(str(prepared.preview_path)))
+        params = self._params
+        out_dir = self.out_dir
+
+        def job(progress, frame):
+            res = render_scene_videos(
+                prepared.all_mosaics(),
+                layout,
+                out_dir,
+                n_videos=params["n_videos"],
+                night_fraction=params.get("night_fraction", 0.0),
+                ir_fraction=params.get("ir_fraction", 0.0),
+                render_modes=params["modes"],
+                duration_s=params["duration_s"],
+                fps=params["fps"],
+                progress_cb=progress,
+                frame_cb=frame,
+            )
+            res.update(prepared.paths())
+            res["run_pipeline"] = bool(params.get("run_pipeline"))
+            return res
+
+        self._worker = StageWorker(job)
         self._worker.progress.connect(self._on_progress)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.finished_ok.connect(self._on_worker_done)
@@ -312,9 +580,12 @@ class SatelliteVideoDialog(QDialog):
             self._on_cancel()
         super().closeEvent(event)
 
-    def params(self) -> Dict[str, Any]:
+    def params(self, require_map: bool = True) -> Dict[str, Any]:
         bbox = self.map_panel.map.selection_bbox()
-        assert bbox is not None
+        if bbox is None:
+            if require_map:
+                raise RuntimeError("No region selected")
+            bbox = (0.0, 0.0, 0.0, 0.0)
         south, west, north, east = bbox
         modes: List[str] = []
         if self.mode_zoom.isChecked():
@@ -341,6 +612,10 @@ class SatelliteVideoDialog(QDialog):
             "num_landmarks": int(self.n_landmarks.value()),
             "n_videos": int(self.n_videos.value()),
             "run_pipeline": self.auto_label.isChecked() and self.run_pipeline.isChecked(),
+            "use_sam": self.use_sam.isChecked(),
+            "review": self.review.isChecked(),
+            "night_fraction": self.night_pct.value() / 100.0,
+            "ir_fraction": self.ir_pct.value() / 100.0,
         }
 
 
@@ -384,16 +659,41 @@ class SatelliteWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class StageWorker(QThread):
+    """Runs job(progress_cb, frame_cb) off the UI thread."""
+
+    finished_ok = Signal(object)
+    failed = Signal(str)
+    progress = Signal(int, int, str)
+    frame_ready = Signal(object)
+
+    def __init__(self, job):
+        super().__init__()
+        self.job = job
+
+    def run(self):
+        try:
+            res = self.job(lambda d, t, m: self.progress.emit(d, t, m), lambda f: self.frame_ready.emit(f))
+            self.finished_ok.emit(res)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            traceback.print_exc()
+            self.failed.emit(str(exc))
+
+
 class AutoPipelineWorker(QThread):
     """Dataset → train → ONNX → package → evaluation, off the UI thread."""
 
-    progress = Signal(str, str)
+    progress = Signal(str, str, object)
     finished_ok = Signal(dict)
     failed = Signal(str)
 
     def __init__(self, project_root: Path, cfg: AutoPipelineConfig):
         super().__init__()
-        self.pipeline = AutoPipeline(project_root, cfg, progress_cb=lambda st, m: self.progress.emit(st, m))
+        self.pipeline = AutoPipeline(
+            project_root, cfg, progress_cb=lambda st, m, pct=None: self.progress.emit(st, m, pct)
+        )
 
     def request_stop(self) -> None:
         self.pipeline.request_stop()
@@ -648,6 +948,7 @@ class DesktopMainWindow(QMainWindow):
         tools_menu.addAction(
             QAction("Generate Satellite Video…", self, triggered=self.generate_satellite_video)
         )
+        tools_menu.addAction(QAction("Edit Landmarks… / ویرایش شاخص‌ها", self, triggered=self.edit_landmarks))
         tools_menu.addAction(QAction("Run Full Pipeline", self, triggered=self.run_full_pipeline))
         tools_menu.addAction(QAction("Test Model on Video…", self, triggered=self.test_model_on_video))
 
@@ -689,11 +990,6 @@ class DesktopMainWindow(QMainWindow):
         for text, slot in [
             ("Play", self.play),
             ("Pause", self.pause),
-            ("Rect ROI", lambda: self.canvas.set_mode("rectangle")),
-            ("Poly ROI", lambda: self.canvas.set_mode("polygon")),
-            ("Save Ann", self.save_current_hint),
-            ("Interpolate", self.run_interpolate),
-            ("Confirm Interp", self.confirm_interp),
         ]:
             b = QPushButton(text)
             b.clicked.connect(slot)
@@ -733,9 +1029,20 @@ class DesktopMainWindow(QMainWindow):
         self.imgsz.setSingleStep(32)
         self.imgsz.setValue(640)
         form.addRow("Imgsz", self.imgsz)
-        self.device = QLineEdit("auto")
-        self.device.setToolTip("auto = CUDA GPU if available, else CPU; or 0 / cpu")
-        form.addRow("Device", self.device)
+        self.device = QComboBox()
+        self._gpu = gpu_name()
+        self._cuda = torch_cuda_ok()
+        self.device.addItem("Auto (GPU if available)", "auto")
+        if self._gpu:
+            self.device.addItem(f"GPU: {self._gpu}" + ("" if self._cuda else "  (needs CUDA PyTorch)"), "0")
+        self.device.addItem("CPU", "cpu")
+        if self._gpu and self._cuda:
+            self.device.setCurrentIndex(self.device.findData("0"))
+        self.device.setToolTip(
+            "Training device. GPU is much faster; the weights are the same for the Jetson either way."
+        )
+        self.device.currentIndexChanged.connect(self._on_device_changed)
+        form.addRow("Train on", self.device)
         rv.addWidget(box)
         self.btn_train = None
         self.btn_build = None
@@ -745,6 +1052,7 @@ class DesktopMainWindow(QMainWindow):
         self.btn_pipeline.clicked.connect(self.run_full_pipeline)
         rv.addWidget(self.btn_pipeline)
         for text, slot in [
+            ("Edit Landmarks… / شاخص‌ها", self.edit_landmarks),
             ("Test Model on Video…", self.test_model_on_video),
             ("Build Dataset", self.build_dataset),
             ("Train YOLO", self.train_yolo),
@@ -759,6 +1067,16 @@ class DesktopMainWindow(QMainWindow):
                 self.btn_train = b
             if text == "Build Dataset":
                 self.btn_build = b
+        self.task_progress = QProgressBar()
+        self.task_progress.setRange(0, 100)
+        self.task_progress.setValue(0)
+        self.task_progress.setTextVisible(True)
+        self.task_progress.setFormat("%p%")
+        self.task_progress.setMinimumHeight(22)
+        rv.addWidget(self.task_progress)
+        self.task_stage = QLabel("")
+        self.task_stage.setStyleSheet("font-weight:bold;")
+        rv.addWidget(self.task_stage)
         self.status_box = QLabel("Ready")
         self.status_box.setWordWrap(True)
         rv.addWidget(self.status_box)
@@ -840,7 +1158,9 @@ class DesktopMainWindow(QMainWindow):
                 if first_row is None and self.project.meta:
                     first_row = len(self.project.meta.videos) - 1
             if paths.get("scene"):
-                self.project.set_scene(paths["scene"], paths.get("scene_preview"), paths.get("mosaic"))
+                self.project.set_scene(
+                    paths["scene"], paths.get("scene_preview"), paths.get("mosaic"), paths.get("candidates")
+                )
             self._auto_labels_cache.clear()
             self._refresh_videos()
             classes = self.project.class_names()
@@ -860,6 +1180,31 @@ class DesktopMainWindow(QMainWindow):
 
     # ------------------------------------------------------------ automatic pipeline
 
+    def _device_value(self) -> str:
+        return self.device.currentData() or "auto"
+
+    def _on_device_changed(self, _i: int = 0) -> None:
+        if self._device_value() == "0" and not self._cuda:
+            QMessageBox.information(self, "GPU", """ + repr(CUDA_HELP) + """)
+
+    def _set_task_progress(self, stage: str, pct, msg: str = "") -> None:
+        names = {
+            "dataset": "Building dataset / ساخت دیتاست",
+            "train": "Training / آموزش",
+            "onnx": "Exporting ONNX",
+            "package": "Jetson package / پکیج جتسون",
+            "evaluate": "Evaluating / ارزیابی",
+            "done": "Done / پایان",
+        }
+        self.task_stage.setText(names.get(stage, stage))
+        if pct is None:
+            self.task_progress.setRange(0, 0)  # busy indicator
+        else:
+            self.task_progress.setRange(0, 100)
+            self.task_progress.setValue(int(round(float(pct))))
+        if msg:
+            self.status_box.setText(msg)
+
     def run_full_pipeline(self):
         if not self.project:
             QMessageBox.warning(self, "Pipeline", "Create or open a project first")
@@ -873,12 +1218,15 @@ class DesktopMainWindow(QMainWindow):
         except ImportError:
             QMessageBox.critical(self, "Pipeline", "ultralytics / torch are not installed in this environment.")
             return
+        if self._device_value() == "0" and not self._cuda:
+            QMessageBox.information(self, "GPU", """ + repr(CUDA_HELP) + """)
+        self._set_task_progress("dataset", 0, "Starting pipeline…")
         cfg = AutoPipelineConfig(
             model_type=self.model_type.currentText(),
             epochs=self.epochs.value(),
             batch=self.batch.value(),
             imgsz=self.imgsz.value(),
-            device=self.device.text().strip() or "auto",
+            device=self._device_value(),
             augment_per_image=self.aug_n.value(),
         )
         self.pause()
@@ -890,11 +1238,12 @@ class DesktopMainWindow(QMainWindow):
         self._pipeline_worker.start()
         self.statusBar().showMessage("Automatic pipeline running…")
 
-    def _on_pipeline_progress(self, stage: str, msg: str):
-        self.status_box.setText(f"[{stage}] {msg}")
-        self.statusBar().showMessage(f"Pipeline: {stage}")
+    def _on_pipeline_progress(self, stage: str, msg: str, pct=None):
+        self._set_task_progress(stage, pct, msg)
+        self.statusBar().showMessage(f"Pipeline: {stage}" + ("" if pct is None else f" {float(pct):.0f}%"))
 
     def _on_pipeline_ok(self, summary: dict):
+        self._set_task_progress("done", 100)
         self.btn_pipeline.setText("▶ Run Full Pipeline")
         self.statusBar().showMessage("Pipeline finished")
         lines = []
@@ -912,10 +1261,75 @@ class DesktopMainWindow(QMainWindow):
         QMessageBox.information(self, "Pipeline finished", "\n\n".join(lines))
 
     def _on_pipeline_failed(self, err: str):
+        self.task_progress.setRange(0, 100)
+        self.task_stage.setText("Failed / خطا")
         self.btn_pipeline.setText("▶ Run Full Pipeline")
         self.statusBar().showMessage("Pipeline failed")
         self.status_box.setText(f"Pipeline failed: {err}")
         QMessageBox.critical(self, "Pipeline", err)
+
+    def edit_landmarks(self):
+        """Review / change the landmarks of this project's scene, then rebuild the labeled videos."""
+        if not self.project:
+            QMessageBox.warning(self, "Landmarks", "Create or open a project first")
+            return
+        if not self.project.scene_path.exists():
+            QMessageBox.information(
+                self, "Landmarks", "No scene yet — use Tools → Generate Satellite Video… (auto-label) first."
+            )
+            return
+        try:
+            prepared = load_prepared_scene(self.project.scene_dir, mosaic_name="mosaic.jpg")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Landmarks", str(exc))
+            return
+        dlg = LandmarkEditorDialog(
+            prepared.mosaic, prepared.layout, prepared.candidates, self,
+            extra_mosaics=prepared.extra_mosaics, extra_masks=prepared.extra_masks,
+        )
+        if qt_exec(dlg) != QDialog.Accepted:
+            return
+        layout = dlg.result_layout()
+        prepared.extra_mosaics, prepared.extra_masks = dlg.result_extras()
+        from desktop_app.satellite.scene import save_candidates
+
+        save_candidates(self.project.scene_dir / "candidates.json", dlg.result_candidates())
+        prepared.out_dir = self.project.scene_dir
+        prepared.save_extras()
+        layout.save(self.project.scene_path)
+        from desktop_app.satellite.scene import draw_scene_preview
+
+        cv2.imwrite(str(self.project.scene_dir / "scene_preview.jpg"), draw_scene_preview(prepared.mosaic, layout))
+        auto_ids = [v.video_id for v in self.project.meta.videos if self.project.auto_labels_path(v.video_id)]
+        ans = QMessageBox.question(
+            self,
+            "Landmarks",
+            f"Landmarks saved ({layout.num_landmarks}).\n\n"
+            f"Rebuild the {len(auto_ids)} auto-labeled videos with the new landmarks and run the full pipeline?\n"
+            "(old auto-labeled videos are removed from the project)",
+        )
+        if ans != QMessageBox.Yes:
+            return
+        for vid in auto_ids:
+            self.project.remove_video(vid)
+        self._auto_labels_cache.clear()
+        out_dir = self.project.exports_dir / f"satellite_{np.random.randint(1e9):09d}"
+        n_videos = max(1, len(auto_ids) or 6)
+
+        def job(progress, frame):
+            res = render_scene_videos(
+                prepared.all_mosaics(), layout, out_dir, n_videos=n_videos,
+                night_fraction=0.25, ir_fraction=0.15, progress_cb=progress, frame_cb=frame,
+            )
+            res["run_pipeline"] = True
+            return res
+
+        self._stage_worker = StageWorker(job)
+        self._stage_worker.progress.connect(lambda d, t, m: self.status_box.setText(f"{m} ({d}%)"))
+        self._stage_worker.finished_ok.connect(self._on_satellite_done)
+        self._stage_worker.failed.connect(lambda e: QMessageBox.critical(self, "Landmarks", e))
+        self._stage_worker.start()
+        self.status_box.setText("Rendering videos with the new landmarks…")
 
     def test_model_on_video(self):
         """Run the trained model on any video: target (green), from landmarks (magenta), landmarks (orange)."""
@@ -931,7 +1345,7 @@ class DesktopMainWindow(QMainWindow):
             return
         out_video = self.project.exports_dir / "evaluation" / f"{Path(path).stem}_localized.mp4"
         scene = self.project.scene_path if self.project.scene_path.exists() else None
-        self._infer_worker = InferenceWorker(weights[-1], Path(path), scene, out_video, self.imgsz.value(), self.device.text().strip())
+        self._infer_worker = InferenceWorker(weights[-1], Path(path), scene, out_video, self.imgsz.value(), self._device_value())
         self._infer_worker.progress.connect(self.status_box.setText)
         self._infer_worker.finished_ok.connect(self._on_infer_ok)
         self._infer_worker.failed.connect(lambda e: QMessageBox.critical(self, "Test", e))
@@ -1153,9 +1567,8 @@ class DesktopMainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Dataset",
-                "No annotations found.\n\n"
-                "Open a video, draw Rect/Poly ROI, click Save Ann "
-                "(optionally Interpolate + Confirm), then Build Dataset.",
+                "No labeled videos found.\n\n"
+                "Use Tools → Generate Satellite Video… (auto-labeled) first, then Build Dataset.",
             )
             return
 
@@ -1176,12 +1589,14 @@ class DesktopMainWindow(QMainWindow):
             augment_per_image=self.aug_n.value(),
             class_name=self.project.meta.target_class if self.project.meta else "target_region",
         )
+        self._set_task_progress("dataset", None, "Building dataset…")
         self._dataset_worker.progress.connect(self.status_box.setText)
         self._dataset_worker.finished_ok.connect(self._on_dataset_ok)
         self._dataset_worker.failed.connect(self._on_dataset_failed)
         self._dataset_worker.start()
 
     def _on_dataset_ok(self, out: str):
+        self._set_task_progress("done", 100)
         if self.btn_build:
             self.btn_build.setEnabled(True)
         self.statusBar().showMessage("Ready")
@@ -1189,6 +1604,8 @@ class DesktopMainWindow(QMainWindow):
         QMessageBox.information(self, "Dataset", f"Created:\n{out}")
 
     def _on_dataset_failed(self, err: str):
+        self.task_progress.setRange(0, 100)
+        self.task_stage.setText("Failed / خطا")
         if self.btn_build:
             self.btn_build.setEnabled(True)
         self.statusBar().showMessage("Ready")
@@ -1220,18 +1637,18 @@ class DesktopMainWindow(QMainWindow):
             )
             return
 
-        device = self.device.text().strip() or "cpu"
+        from desktop_app.pipeline.auto import resolve_device
+
+        device = resolve_device(self._device_value())
         if device not in ("cpu", "mps"):
             try:
                 import torch
 
                 if not torch.cuda.is_available():
                     device = "cpu"
-                    self.device.setText("cpu")
                     self.status_box.setText("CUDA not available — using CPU")
             except Exception:
                 device = "cpu"
-                self.device.setText("cpu")
 
         runner = TrainingRunner(
             datasets[-1],
@@ -1243,7 +1660,7 @@ class DesktopMainWindow(QMainWindow):
             device=device,
         )
         self._train_worker = TrainWorker(runner)
-        self._train_worker.progress.connect(lambda d: self.status_box.setText(json.dumps(d)[:300]))
+        self._train_worker.progress.connect(self._on_train_progress)
         self._train_worker.finished_ok.connect(self._on_train_ok)
         self._train_worker.failed.connect(self._on_train_failed)
         if self.btn_train:
@@ -1252,7 +1669,22 @@ class DesktopMainWindow(QMainWindow):
         self.status_box.setText(f"Training started on {device}… (first run may download weights)")
         self.statusBar().showMessage("Training…")
 
+    def _on_train_progress(self, d: dict):
+        if d.get("type") == "batch":
+            eta = d.get("eta_sec")
+            eta_s = f" — ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
+            self._set_task_progress(
+                "train", 100.0 * float(d.get("fraction", 0.0)), f"Epoch {d['epoch']}/{d['epochs']} batch {d['batch']}/{d['nb']}{eta_s}"
+            )
+        elif "status" in d:
+            self._set_task_progress("train", 0, d["status"])
+        else:
+            m = d.get("metrics", {})
+            key = next((k for k in m if "mAP50(" in k), None)
+            self.status_box.setText(f"Epoch {d.get('epoch')} done" + (f" — {key}={m[key]:.3f}" if key else ""))
+
     def _on_train_ok(self, result: dict):
+        self._set_task_progress("done", 100)
         if self.btn_train:
             self.btn_train.setEnabled(True)
         self.statusBar().showMessage("Ready")
@@ -1260,6 +1692,8 @@ class DesktopMainWindow(QMainWindow):
         QMessageBox.information(self, "Train", str(result))
 
     def _on_train_failed(self, err: str):
+        self.task_progress.setRange(0, 100)
+        self.task_stage.setText("Failed / خطا")
         if self.btn_train:
             self.btn_train.setEnabled(True)
         self.statusBar().showMessage("Ready")

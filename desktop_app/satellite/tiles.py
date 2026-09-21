@@ -40,6 +40,127 @@ LAYERS: Dict[str, Dict[str, str]] = {
     },
 }
 
+# Additional imagery sources (all usable for mosaics unless "mosaic": "0")
+LAYERS.update(
+    {
+        "esri_clarity": {
+            "url": "https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            "attribution": "Esri World Imagery (Clarity)",
+            "cache": "esri_clarity",
+            "title": "Esri Clarity (sharper processing)",
+        },
+        "sentinel2": {
+            "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg",
+            "attribution": "Sentinel-2 cloudless 2023 by EOX (CC BY-NC-SA 4.0, contains Copernicus data)",
+            "cache": "eox_s2cloudless_2023",
+            "title": "Sentinel-2 cloudless 2023 (10 m, non-commercial)",
+            "max_zoom": "15",
+        },
+        "night_lights": {
+            "url": (
+                "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/2016-01-01/"
+                "GoogleMapsCompatible_Level8/{z}/{y}/{x}.png"
+            ),
+            "attribution": "NASA Black Marble (VIIRS night lights, ~500 m)",
+            "cache": "nasa_black_marble",
+            "title": "NASA night lights (view only, ~500 m)",
+            "max_zoom": "8",
+            "mosaic": "0",
+        },
+    }
+)
+LAYERS["satellite"]["title"] = "Esri World Imagery"
+LAYERS["map"]["title"] = "Esri Street Map"
+LAYERS["map"]["mosaic"] = "0"
+
+WAYBACK_CONFIG_URL = "https://s3-us-west-2.amazonaws.com/config.maptiles.arcgis.com/waybackconfig.json"
+
+
+def layer_max_zoom(layer: str) -> int:
+    return int(LAYERS.get(layer, {}).get("max_zoom", 19))
+
+
+def mosaic_layers() -> Dict[str, str]:
+    """layer key → title, for sources usable as training imagery."""
+    return {k: v.get("title", k) for k, v in LAYERS.items() if v.get("mosaic", "1") != "0"}
+
+
+def register_custom_layer(url_template: str, title: str = "Custom XYZ", max_zoom: int = 19) -> str:
+    """Add an XYZ tile source ({z}/{x}/{y} placeholders) and return its layer key."""
+    import hashlib
+
+    if not all(t in url_template for t in ("{z}", "{x}", "{y}")):
+        raise ValueError("Custom tile URL must contain {z}, {x} and {y}")
+    key = "custom_" + hashlib.md5(url_template.encode("utf-8")).hexdigest()[:10]
+    LAYERS[key] = {
+        "url": url_template,
+        "attribution": title,
+        "cache": key,
+        "title": title,
+        "max_zoom": str(max_zoom),
+    }
+    return key
+
+
+def list_wayback_releases(cache_dir: str | Path | None = None, timeout: float = 20.0) -> list:
+    """
+    Esri World Imagery Wayback: every archived version (date) of the imagery.
+    Returns [{"id", "date", "title", "url"}] newest first; cached on disk.
+    """
+    import json
+    import re
+
+    root = Path(cache_dir) if cache_dir else Path("data") / "satellite_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    cfg_path = root / "waybackconfig.json"
+    cfg = None
+    fresh = cfg_path.exists() and (time.time() - cfg_path.stat().st_mtime) < 7 * 86400
+    if not fresh:
+        try:
+            req = urllib.request.Request(WAYBACK_CONFIG_URL, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                cfg = json.loads(resp.read())
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Wayback config download failed: %s", exc)
+    if cfg is None and cfg_path.exists():
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    out = []
+    for rid, item in (cfg or {}).items():
+        title = item.get("itemTitle", "")
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", title)
+        url = item.get("itemURL", "")
+        if not m or not url:
+            continue
+        out.append({"id": str(rid), "date": m.group(1), "title": title, "url": url})
+    out.sort(key=lambda r: r["date"], reverse=True)
+    return out
+
+
+def register_wayback_layer(release: dict) -> str:
+    """Make one Wayback release usable as a tile layer; returns its key."""
+    key = f"wayback_{release['id']}"
+    url = release["url"].replace("{level}", "{z}").replace("{row}", "{y}").replace("{col}", "{x}")
+    LAYERS[key] = {
+        "url": url,
+        "attribution": f"Esri World Imagery Wayback {release['date']}",
+        "cache": key,
+        "title": f"Esri Wayback {release['date']}",
+    }
+    return key
+
+
+def pick_wayback_dates(releases: list, n: int, exclude_key: str = "") -> list:
+    """Spread ``n`` releases over the archive (different seasons / years)."""
+    pool = [r for r in releases if f"wayback_{r['id']}" != exclude_key]
+    if n <= 0 or not pool:
+        return []
+    if n >= len(pool):
+        return pool
+    idx = [round(i * (len(pool) - 1) / max(1, n - 1)) for i in range(n)] if n > 1 else [len(pool) // 2]
+    return [pool[i] for i in sorted(set(idx))]
+
+
 # Back-compat alias
 ESRI_URL = LAYERS["satellite"]["url"]
 
@@ -228,6 +349,7 @@ def fetch_mosaic(
         progress_cb(0, total, f"Downloading tiles 0/{total}")
     mosaic = np.zeros((n_y * TILE_SIZE, n_x * TILE_SIZE, 3), dtype=np.uint8)
     done = 0
+    failed = 0
     preview_every = max(1, total // 20)
 
     def _emit_preview() -> None:
@@ -248,7 +370,16 @@ def fetch_mosaic(
 
     for iy, ty in enumerate(range(ty0, ty1 + 1)):
         for ix, tx in enumerate(range(tx0, tx1 + 1)):
-            tile = download_tile(zoom, tx, ty, root, layer=layer)
+            try:
+                tile = download_tile(zoom, tx, ty, root, layer=layer)
+            except RuntimeError as exc:
+                failed += 1
+                if failed > max(3, total * 0.3):
+                    raise RuntimeError(
+                        f"Imagery source '{LAYERS[layer].get('title', layer)}' has no data for this area/zoom "
+                        f"({failed} tiles failed). Choose another source or a lower zoom."
+                    ) from exc
+                tile = np.full((TILE_SIZE, TILE_SIZE, 3), 96, np.uint8)
             if tile.shape[0] != TILE_SIZE or tile.shape[1] != TILE_SIZE:
                 tile = cv2.resize(tile, (TILE_SIZE, TILE_SIZE))
             y_off = iy * TILE_SIZE

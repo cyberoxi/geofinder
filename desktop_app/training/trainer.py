@@ -100,7 +100,43 @@ class TrainingRunner:
             if self._stop:
                 trainer.stop = True
 
+        batch_state = {"i": 0, "t0": 0.0, "start": None}
+
+        def on_train_epoch_start(trainer):  # noqa: ANN001
+            import time as _t
+
+            batch_state["i"] = 0
+            batch_state["t0"] = _t.time()
+            if batch_state["start"] is None:
+                batch_state["start"] = _t.time()
+
+        def on_train_batch_end(trainer):  # noqa: ANN001
+            import time as _t
+
+            batch_state["i"] += 1
+            nb = max(1, len(getattr(trainer, "train_loader", []) or []))
+            i = batch_state["i"]
+            if progress_cb and (i == 1 or i % 2 == 0 or i == nb):
+                epoch = int(getattr(trainer, "epoch", 0))
+                epochs = int(getattr(trainer, "epochs", self.epochs) or self.epochs)
+                done = (epoch + i / nb) / max(1, epochs)
+                elapsed = _t.time() - (batch_state["start"] or _t.time())
+                eta = elapsed / done * (1 - done) if done > 0.01 else None
+                progress_cb({
+                    "type": "batch",
+                    "epoch": epoch + 1,
+                    "epochs": epochs,
+                    "batch": i,
+                    "nb": nb,
+                    "fraction": done,
+                    "eta_sec": eta,
+                })
+            if self._stop:
+                trainer.stop = True
+
         model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+        model.add_callback("on_train_epoch_start", on_train_epoch_start)
+        model.add_callback("on_train_batch_end", on_train_batch_end)
         if progress_cb:
             progress_cb({"epoch": 0, "metrics": {}, "status": f"Training on {device}…"})
 
@@ -124,7 +160,7 @@ class TrainingRunner:
             "results_dir": str(self.runs_dir / "train"),
             "device": device,
         }
-        (self.runs_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        (self.runs_dir / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
         return summary
 
     def export_onnx(self, weights: Optional[str | Path] = None, output: Optional[str | Path] = None) -> Path:

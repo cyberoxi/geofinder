@@ -18,7 +18,7 @@ import cv2
 import numpy as np
 
 from desktop_app.satellite.video_gen import _ease_in_out, _overlay_attribution, _write_video
-from shared.landmarks import SceneLayout, apply_affine, clip_polygon_to_frame, polygon_area_abs
+from shared.landmarks import SceneLayout, apply_affine, clip_polygon_to_frame, json_default, polygon_area_abs
 from shared.logging import get_logger
 
 logger = get_logger("desktop.satellite.synth")
@@ -78,6 +78,79 @@ class Photometric:
         if self.blur:
             out = cv2.GaussianBlur(out, (self.blur, self.blur), 0)
         return out
+
+
+def make_night_mosaic(mosaic: np.ndarray, meters_per_px: float, rng: random.Random, mode: str = "night") -> np.ndarray:
+    """
+    Simulated night view of a daytime mosaic (no free high-resolution night satellite
+    imagery exists — VIIRS/Black Marble is ~500 m/px).
+
+    ``night``: moonlit dark scene + streetlights along detected roads + lit windows /
+    floodlit fields.  ``ir``: thermal-like white-hot rendering (asphalt warm,
+    vegetation / water cool).  Lights live in mosaic coordinates, so they stay fixed
+    on the ground in every frame of a video.
+    """
+    from desktop_app.satellite.objects import _SceneStats
+
+    H, W = mosaic.shape[:2]
+    ds = min(1.0, 1400.0 / max(W, H))
+    small = cv2.resize(mosaic, (max(1, int(W * ds)), max(1, int(H * ds))), interpolation=cv2.INTER_AREA)
+    mpp = max(0.05, (meters_per_px or 0.6) / ds)
+    st = _SceneStats(small, mpp)
+    road = (st.dark & (st.texture < max(14.0, st.median_tex))).astype(np.uint8)
+    L = st.L / 255.0
+    green = (st.lab[..., 1] < st.median_lab[1] - 5).astype(np.float32)
+    nprng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+
+    if mode == "ir":
+        # White-hot thermal look: dark asphalt retains heat, vegetation / water are cool.
+        temp = 0.55 * (1.0 - L) + 0.35 * (1.0 - green) * L + 0.25 * road
+        temp = cv2.GaussianBlur(temp.astype(np.float32), (0, 0), max(0.8, 1.5 / mpp))  # thermal sensors are soft
+        lo, hi = np.percentile(temp, 1), np.percentile(temp, 99.5)
+        temp = np.clip((temp - lo) / max(1e-6, hi - lo), 0, 1)
+        # Thermal AGC: spread the histogram (avoid a washed-out image)
+        eq = cv2.equalizeHist((temp * 255).astype(np.uint8)).astype(np.float32) / 255.0
+        temp = 0.5 * temp + 0.5 * eq
+        if rng.random() < 0.5:
+            temp = 1.0 - temp  # black-hot polarity
+        g = cv2.resize((temp * 255).astype(np.uint8), (W, H), interpolation=cv2.INTER_LINEAR)
+        return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+
+    # --- night (visible camera)
+    base = mosaic.astype(np.float32) / 255.0
+    dark = np.power(base, 2.0) * rng.uniform(0.08, 0.2)
+    dark *= np.array([1.2, 0.95, 0.75], np.float32)  # moonlight tint (BGR)
+
+    light = np.zeros(small.shape[:2], np.float32)
+    ys, xs = np.nonzero(road)
+    if len(xs):
+        spacing_px = rng.uniform(25.0, 45.0) / mpp
+        n_lamps = int(min(len(xs), road.sum() / max(1.0, spacing_px * spacing_px) * 4))
+        idx = nprng.choice(len(xs), size=max(1, n_lamps), replace=False)
+        light[ys[idx], xs[idx]] = nprng.uniform(0.6, 1.0, len(idx))
+    # Sparse lit windows / courtyards off the road network
+    off = np.nonzero((road == 0) & (st.texture > st.median_tex * 0.6))
+    if len(off[0]):
+        k = int(len(off[0]) * rng.uniform(0.0015, 0.004))
+        idx = nprng.choice(len(off[0]), size=max(1, k), replace=False)
+        light[off[0][idx], off[1][idx]] = nprng.uniform(0.2, 0.6, len(idx))
+    core = cv2.GaussianBlur(light, (0, 0), max(0.6, 3.0 / mpp)) * 20.0
+    halo = cv2.GaussianBlur(light, (0, 0), max(1.5, 12.0 / mpp)) * 60.0
+    glow = np.clip(core + halo, 0, 1.5)
+    # Floodlit sports fields / large plazas (some of them)
+    flat = (st.texture < 0.4 * st.median_tex).astype(np.uint8)
+    n, lab_img, stats, _ = cv2.connectedComponentsWithStats(flat)
+    min_area = (40.0 / mpp) ** 2
+    flood = np.zeros_like(glow)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area and rng.random() < 0.3:
+            flood[lab_img == i] = rng.uniform(0.2, 0.4)
+    # Soft falloff at the edges of floodlit areas
+    glow = np.maximum(glow, cv2.GaussianBlur(flood, (0, 0), max(1.0, 6.0 / mpp)))
+    glow = cv2.resize(glow, (W, H), interpolation=cv2.INTER_LINEAR)
+    lamp = np.array([0.35, 0.7, 1.0], np.float32) if rng.random() < 0.6 else np.array([1.0, 0.95, 0.9], np.float32)
+    lit = dark + glow[..., None] * lamp * (0.35 + 0.65 * base)
+    return (np.clip(lit, 0, 1) * 255).astype(np.uint8)
 
 
 class MosaicCamera:
@@ -141,11 +214,14 @@ def frame_labels(
     height: int,
     min_side_px: float = 10.0,
     min_visible: Dict[int, float] | None = None,
+    keep: Optional[set] = None,
 ) -> List[Tuple[int, List[List[float]]]]:
-    """Project every scene object; keep those sufficiently visible."""
+    """Project every scene object; keep those sufficiently visible (and covered by the imagery)."""
     min_visible = min_visible or {}
     out = []
     for cid in range(len(layout.classes)):
+        if keep is not None and cid not in keep:
+            continue
         poly = apply_affine(layout.polygon(cid), M)
         full = polygon_area_abs(poly)
         if full <= 0 or math.sqrt(full) < min_side_px:
@@ -252,6 +328,8 @@ def render_labeled_video(
     seed: int = 0,
     kind: str = "zoom",
     attribution: bool = True,
+    extra_meta: Optional[Dict] = None,
+    keep_classes: Optional[set] = None,
     progress_cb: Optional[ProgressCb] = None,
     frame_cb: Optional[FrameCb] = None,
     progress_label: str = "Rendering",
@@ -268,8 +346,8 @@ def render_labeled_video(
                 img = photometric.apply(img, np_rng)
             if attribution and (i == 0 or i == len(poses) - 1):
                 img = _overlay_attribution(img)
-            labels.append(frame_labels(layout, M, cam.out_w, cam.out_h))
-            scales.append(cam.out_h / pose.view_h)
+            labels.append(frame_labels(layout, M, cam.out_w, cam.out_h, keep=keep_classes))
+            scales.append(float(cam.out_h / pose.view_h))
             yield img
 
     video_path = _write_video(
@@ -288,13 +366,15 @@ def render_labeled_video(
             {
                 "version": 1,
                 "kind": kind,
+                **(extra_meta or {}),
                 "width": cam.out_w,
                 "height": cam.out_h,
                 "fps": fps,
                 "classes": list(layout.classes),
                 "scale": [round(s, 6) for s in scales],
                 "frames": labels,
-            }
+            },
+            default=json_default,
         ),
         encoding="utf-8",
     )
@@ -310,7 +390,7 @@ def load_labels(path: str | Path) -> Dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def plan_variants(n_videos: int, seed: int = 0) -> List[Dict]:
+def plan_variants(n_videos: int, seed: int = 0, night_fraction: float = 0.0, ir_fraction: float = 0.0) -> List[Dict]:
     """
     Variant recipe list.  Video 0 is the canonical north-up zoom; the rest mix
     rotated / off-centre zooms, deep zooms and low-altitude passes (where the
@@ -346,4 +426,20 @@ def plan_variants(n_videos: int, seed: int = 0) -> List[Dict]:
                 }
             )
         i += 1
-    return plans[:n_videos]
+    plans = plans[:n_videos]
+    for p in plans:
+        p["light"] = "day"
+    # Lighting: video 0 stays the canonical daylight zoom; spread night / IR over the rest
+    others = list(range(1, len(plans)))
+    rng.shuffle(others)
+    n_night = int(round(night_fraction * len(plans)))
+    n_ir = int(round(ir_fraction * len(plans)))
+    if night_fraction > 0 and n_night == 0 and others:
+        n_night = 1
+    if ir_fraction > 0 and n_ir == 0 and len(others) > n_night:
+        n_ir = 1
+    for j in others[:n_night]:
+        plans[j]["light"] = "night"
+    for j in others[n_night : n_night + n_ir]:
+        plans[j]["light"] = "ir"
+    return plans

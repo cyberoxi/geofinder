@@ -23,6 +23,15 @@ import numpy as np
 TARGET_CLASS_ID = 0
 
 
+def json_default(o):
+    """json.dumps(default=...) for numpy scalars / arrays."""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
 def polygon_area_abs(points: np.ndarray) -> float:
     pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
     if len(pts) < 3:
@@ -31,21 +40,50 @@ def polygon_area_abs(points: np.ndarray) -> float:
 
 
 def clip_polygon_to_frame(points: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Intersect a convex polygon with the frame rectangle (returns (N,2) float32, maybe empty)."""
-    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    """
+    Clip a polygon (convex or concave) to the frame rectangle — Sutherland–Hodgman.
+    Returns (N,2) float32, empty when nothing is inside.
+    """
+    pts = [tuple(p) for p in np.asarray(points, dtype=np.float64).reshape(-1, 2)]
     if len(pts) < 3:
         return np.zeros((0, 2), np.float32)
-    frame = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
-    # intersectConvexConvex requires consistent orientation
-    if cv2.contourArea(pts, oriented=True) < 0:
-        pts = pts[::-1].copy()
-    area, inter = cv2.intersectConvexConvex(pts, frame)
-    if area <= 0 or inter is None:
+    x_max, y_max = float(width - 1), float(height - 1)
+    edges = (
+        (lambda p: p[0] >= 0.0, lambda a, b: _x_cross(a, b, 0.0)),
+        (lambda p: p[0] <= x_max, lambda a, b: _x_cross(a, b, x_max)),
+        (lambda p: p[1] >= 0.0, lambda a, b: _y_cross(a, b, 0.0)),
+        (lambda p: p[1] <= y_max, lambda a, b: _y_cross(a, b, y_max)),
+    )
+    for inside, cross in edges:
+        if not pts:
+            break
+        out = []
+        prev = pts[-1]
+        for cur in pts:
+            if inside(cur):
+                if not inside(prev):
+                    out.append(cross(prev, cur))
+                out.append(cur)
+            elif inside(prev):
+                out.append(cross(prev, cur))
+            prev = cur
+        pts = out
+    if len(pts) < 3:
         return np.zeros((0, 2), np.float32)
-    out = inter.reshape(-1, 2).astype(np.float32)
-    out[:, 0] = np.clip(out[:, 0], 0, width - 1)
-    out[:, 1] = np.clip(out[:, 1], 0, height - 1)
-    return out
+    res = np.asarray(pts, np.float32)
+    if polygon_area_abs(res) <= 0:
+        return np.zeros((0, 2), np.float32)
+    return res
+
+
+def _x_cross(a, b, x):
+    t = (x - a[0]) / (b[0] - a[0])
+    return (x, a[1] + t * (b[1] - a[1]))
+
+
+def _y_cross(a, b, y):
+    t = (y - a[1]) / (b[1] - a[1])
+    return (a[0] + t * (b[0] - a[0]), y)
 
 
 def apply_affine(points: np.ndarray, M: np.ndarray) -> np.ndarray:
@@ -101,7 +139,7 @@ class SceneLayout:
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=json_default), encoding="utf-8")
         return path
 
     @classmethod

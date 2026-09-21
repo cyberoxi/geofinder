@@ -135,10 +135,22 @@ class ProjectManager:
     def scene_path(self) -> Path:
         return self.scene_dir / "scene.json"
 
-    def set_scene(self, scene_json: str | Path, preview: str | Path | None = None, mosaic: str | Path | None = None) -> Path:
+    def set_scene(
+        self,
+        scene_json: str | Path,
+        preview: str | Path | None = None,
+        mosaic: str | Path | None = None,
+        candidates: str | Path | None = None,
+    ) -> Path:
         """Install the scene layout (target + landmarks) used for multi-class training."""
         self.scene_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(scene_json, self.scene_path)
+        if candidates and Path(candidates).exists():
+            shutil.copy2(candidates, self.scene_dir / "candidates.json")
+        for old_extra in self.scene_dir.glob("mosaic_extra_*"):
+            old_extra.unlink()
+        for extra in Path(scene_json).parent.glob("mosaic_extra_*"):
+            shutil.copy2(extra, self.scene_dir / extra.name)
         if preview and Path(preview).exists():
             shutil.copy2(preview, self.scene_dir / "scene_preview.jpg")
         if mosaic and Path(mosaic).exists():
@@ -173,6 +185,24 @@ class ProjectManager:
             return None
         with open(p, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def remove_video(self, video_id: str) -> None:
+        """Drop a video from the project (file, auto labels and annotations)."""
+        if self.meta is None:
+            return
+        for v in list(self.meta.videos):
+            if v.video_id == video_id:
+                path = self.root / v.relative_path
+                self.meta.videos.remove(v)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        lbl = self.auto_labels_dir / f"{video_id}.json"
+        lbl.unlink(missing_ok=True)
+        self.conn.execute("DELETE FROM annotations WHERE video_id=?", (video_id,))
+        self.conn.commit()
+        self.save_meta()
 
     def resolve_video(self, video_id: str) -> Path:
         if self.meta is None:

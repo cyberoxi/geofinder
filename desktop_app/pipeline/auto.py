@@ -16,7 +16,10 @@ from shared.logging import get_logger
 
 logger = get_logger("desktop.pipeline")
 
-StageCb = Callable[[str, str], None]  # (stage, message)
+StageCb = Callable[..., None]  # (stage, message, percent 0..100 or None)
+
+# Overall progress share of each stage (percent range)
+STAGE_RANGE = {"dataset": (0, 10), "train": (10, 88), "onnx": (88, 92), "package": (92, 95), "evaluate": (95, 100), "done": (100, 100)}
 
 
 @dataclass
@@ -31,6 +34,42 @@ class AutoPipelineConfig:
     export_onnx: bool = True
     build_package: bool = True
     evaluate: bool = True
+
+
+def _parse_fraction(msg: str) -> Optional[float]:
+    """'… video 2/6 …' / '… 30/48 …' → rough fraction for the dataset stage."""
+    import re
+
+    m = re.search(r"video (\d+)/(\d+)", msg) or re.search(r"(\d+)/(\d+)", msg)
+    if not m:
+        return None
+    a, b = int(m.group(1)), int(m.group(2))
+    return a / b if b else None
+
+
+def gpu_name() -> Optional[str]:
+    """Name of the first NVIDIA GPU (via nvidia-smi), even if PyTorch is a CPU build."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5)
+        name = out.stdout.strip().splitlines()[0].strip() if out.returncode == 0 and out.stdout.strip() else None
+        return name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def torch_cuda_ok() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def resolve_device(device: str) -> str:
@@ -60,10 +99,15 @@ class AutoPipeline:
         if self.runner is not None:
             self.runner.request_stop()
 
-    def _emit(self, stage: str, msg: str) -> None:
+    def _emit(self, stage: str, msg: str, fraction: Optional[float] = None) -> None:
+        """fraction = progress inside the stage (0..1); mapped to an overall percentage."""
         logger.info("[%s] %s", stage, msg)
+        lo, hi = STAGE_RANGE.get(stage, (0, 100))
+        pct = None if fraction is None else lo + (hi - lo) * max(0.0, min(1.0, fraction))
+        if pct is None and stage in STAGE_RANGE:
+            pct = lo
         if self.progress_cb:
-            self.progress_cb(stage, msg)
+            self.progress_cb(stage, msg, pct)
 
     def _check_stop(self) -> None:
         if self._stop:
@@ -89,7 +133,7 @@ class AutoPipeline:
                 class_name=pm.meta.target_class,
                 auto_every_n=self.cfg.auto_every_n,
             )
-            dataset_dir = builder.build(progress_cb=lambda m: self._emit("dataset", m))
+            dataset_dir = builder.build(progress_cb=lambda m: self._emit("dataset", m, _parse_fraction(m)))
             split_info = json.loads((dataset_dir / "split_by_video.json").read_text(encoding="utf-8"))
             summary["dataset"] = {"path": str(dataset_dir), **split_info}
             self._check_stop()
@@ -108,14 +152,25 @@ class AutoPipeline:
 
             def _train_cb(d: Dict[str, Any]) -> None:
                 if "status" in d:
-                    self._emit("train", d["status"])
+                    self._emit("train", d["status"], 0.0)
+                    return
+                if d.get("type") == "batch":
+                    eta = d.get("eta_sec")
+                    eta_s = f" — ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
+                    self._emit(
+                        "train",
+                        f"Epoch {d['epoch']}/{d['epochs']} batch {d['batch']}/{d['nb']}{eta_s}",
+                        d.get("fraction"),
+                    )
                     return
                 m = d.get("metrics", {})
                 key = next((k for k in m if "mAP50(" in k and "(M)" in k), None) or next(
                     (k for k in m if "mAP50(" in k), None
                 )
                 extra = f" {key}={m[key]:.3f}" if key else ""
-                self._emit("train", f"Epoch {d.get('epoch')}/{self.cfg.epochs}{extra}")
+                ep = d.get("epoch", 0)
+                label = f"Epoch {ep}/{self.cfg.epochs}" if ep <= self.cfg.epochs else "Final validation"
+                self._emit("train", f"{label}{extra}", min(1.0, ep / max(1, self.cfg.epochs)))
 
             train = self.runner.run(progress_cb=_train_cb)
             summary["train"] = train
@@ -140,7 +195,7 @@ class AutoPipeline:
                 self._emit("package", "Building Jetson package…")
                 zip_path = PackageBuilder(pm).build(weights_pt=best, weights_onnx=onnx_path)
                 summary["package"] = str(zip_path)
-                self._emit("package", f"Package ready: {zip_path}")
+                self._emit("package", f"Package ready: {zip_path}", 1.0)
             self._check_stop()
 
             # 5. Evaluate on held-out auto-labeled videos (test split, else val)
@@ -162,9 +217,9 @@ class AutoPipeline:
         held_out = [v for v, s in split_map.items() if s == "test"] or [v for v, s in split_map.items() if s == "val"]
         held_out = [v for v in held_out if pm.auto_labels_path(v) is not None][:2]
         results = []
-        for vid in held_out:
+        for k, vid in enumerate(held_out):
             self._check_stop()
-            self._emit("evaluate", f"Evaluating on held-out video {vid}…")
+            self._emit("evaluate", f"Evaluating on held-out video {vid}…", k / max(1, len(held_out)))
             out_video = pm.exports_dir / "evaluation" / f"{vid}_localized.mp4"
             m = run_on_video(
                 best,

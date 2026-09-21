@@ -61,19 +61,36 @@ pip install -r requirements-jetson.txt
 7. **Export ONNX** — `runs/model.onnx` or `tools/export_onnx.py`.
 8. **Build Jetson Package** — ZIP with manifest, reference bank (AKAZE), checksums, runtime.yaml.
 
-### Satellite synthetic video (optional)
+### Automatic pipeline: satellite region → Jetson package
 
-Generate zoom-flyover and/or pan clips from **Esri World Imagery** tiles (no API key). Useful for demos and pipeline smoke tests — **not** a substitute for real drone footage in production tracking.
+Select a region on a satellite map. Everything after that is automatic:
 
-**GUI:** open a project → **Tools → Generate Satellite Video…** → search a place and/or pan/zoom → toggle **Satellite / Map** → **Select Region** and drag a box (this is the *end* of the zoom) → optionally raise **Zoom depth (×)** (default 12) so the clip starts farther out → **Generate Video**. Clips go under `exports/satellite/` and into the project video list.
+1. **Imagery.** Esri World Imagery tiles (no API key) are fetched for an area *Zoom depth ×* larger than the selection.
+2. **Exact target polygon.** The selection is projected into mosaic pixels (Web Mercator).
+3. **Landmark discovery.** *K* distinctive patches around the target are picked automatically (stadiums, large roofs, parks and so on). They are scored by rarity against the whole mosaic, local uniqueness (no look-alike nearby) and texture, and spread around the target. See `scene/scene_preview.jpg`.
+4. **Varied labeled videos.** The generator renders a canonical zoom-in plus rotated, off-centre and deep zooms, low passes where the target leaves the view, and lighting, haze and blur changes. The target and every landmark are projected into each frame through the same affine used to render it, so **labels are exact with no manual annotation**. Labels sit next to each video as `*.labels.json` and are shown on the annotation canvas.
+5. **Dataset.** Multi-class YOLO data: class 0 = target, 1..K = landmarks. Split is by video, background frames are included, and augmentation applies to train only.
+6. **Train → ONNX → package → evaluation.** The pipeline scores the model on a held-out video and writes `exports/evaluation/*_localized.mp4`.
 
-**CLI:**
+**GUI:** **Tools → Generate Satellite Video…** → select the region → keep *Auto-label target + landmarks* and *Then run full pipeline* checked → **Generate Video**. You can also press **▶ Run Full Pipeline** at any time, and use **Test Model on Video…** to run the model on any clip.
+
+**CLI (headless):**
 
 ```bash
-python tools/satellite_video.py --lat 35.6892 --lon 51.3890 --span 0.02 --modes both --out data/output
+python tools/auto_pipeline.py --project data/projects/my_site \
+    --south 35.6885 --west 51.3880 --north 35.6899 --east 51.3900 \
+    --videos 6 --landmarks 4 --epochs 40 --imgsz 640
 ```
 
-Outputs `satellite_zoom.mp4`, `satellite_pan.mp4`, and `satellite_mosaic.jpg`. Tiles cache under `data/satellite_cache/`. Attribution: Esri World Imagery.
+**Locating the target from landmarks (runtime).** The package carries `reference/scene.json` (target and landmark layout). On the Jetson, when YOLO does not see the target directly (too small, occluded or out of frame) but sees landmarks, `shared.landmarks.TargetLocalizer` fits a similarity transform:
+- 2 or more landmarks: RANSAC fit of scale, rotation and shift.
+- 1 landmark: scale from its size, heading from the last estimate.
+
+The target polygon is then projected through that transform. When it is off-screen, the overlay draws an arrow toward it. Colors: green = target detected, magenta = target inferred from landmarks, orange = landmarks.
+
+> Synthetic satellite footage is not real drone video. Add real clips of the site (annotated or tested with *Test Model on Video…*) before relying on it in the field.
+
+Legacy clips without labels: `python tools/satellite_video.py --lat 35.6892 --lon 51.3890 --span 0.02 --modes both --out data/output`. Tiles cache under `data/satellite_cache/`. Attribution: Esri World Imagery.
 
 ### Dataset layout
 

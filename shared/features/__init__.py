@@ -19,12 +19,26 @@ class FeatureSet:
     image_shape: Tuple[int, int]
 
 
+def effective_feature_method(name: str) -> str:
+    """AKAZE was removed from the main module in OpenCV 5 — fall back to ORB (also binary/Hamming)."""
+    name = (name or "AKAZE").upper()
+    if name == "AKAZE" and not hasattr(cv2, "AKAZE_create"):
+        return "ORB"
+    return name
+
+
+def create_feature_detector(name: str, max_features: int = 2000):
+    if effective_feature_method(name) == "ORB":
+        return cv2.ORB_create(nfeatures=max_features)
+    return cv2.AKAZE_create()
+
+
 class FeatureExtractor:
     def __init__(self, detector_name: str = "AKAZE", max_features: int = 2000, lowe_ratio: float = 0.75):
-        self.detector_name = detector_name.upper()
+        self.detector_name = effective_feature_method(detector_name)
         self.max_features = max_features
         self.lowe_ratio = lowe_ratio
-        self._detector = cv2.ORB_create(nfeatures=max_features) if self.detector_name == "ORB" else cv2.AKAZE_create()
+        self._detector = create_feature_detector(self.detector_name, max_features)
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
     def extract(self, image: np.ndarray, mask: Optional[np.ndarray] = None) -> FeatureSet:

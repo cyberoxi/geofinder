@@ -37,7 +37,8 @@ class FeatureTracker:
         self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
     def _build_detector(self):
-        if self.detector_name == "ORB":
+        if self.detector_name == "ORB" or not hasattr(cv2, "AKAZE_create"):
+            # OpenCV 5 has no AKAZE in the main module — ORB is the binary fallback
             return cv2.ORB_create(nfeatures=self.max_features)
         # Default AKAZE — robust and Jetson-friendly
         return cv2.AKAZE_create()

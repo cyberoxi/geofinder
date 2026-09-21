@@ -56,7 +56,8 @@ def _augment(
         img = cv2.GaussianBlur(img, (k, k), 0)
     if rng.random() < 0.3:
         noise = rng.randint(5, 20)
-        img = np.clip(img.astype(np.int16) + rng.randint(-noise, noise, img.shape, dtype=np.int16), 0, 255).astype(np.uint8)
+        np_rng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+        img = np.clip(img.astype(np.int16) + np_rng.integers(-noise, noise, img.shape, dtype=np.int16), 0, 255).astype(np.uint8)
     if rng.random() < 0.25:
         # Simple shadow rectangle
         x0, y0 = rng.randint(0, w // 2), rng.randint(0, h // 2)
@@ -75,14 +76,7 @@ def _augment(
 
     out = []
     for pts in polys:
-        if len(pts) >= 3 and cv2.isContourConvex(pts.reshape(-1, 1, 2)):
-            out.append(clip_polygon_to_frame(pts, w, h))
-        else:  # manual non-convex polygons: clamp vertices
-            pts = pts.copy()
-            if len(pts):
-                pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
-                pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
-            out.append(pts)
+        out.append(clip_polygon_to_frame(pts, w, h) if len(pts) >= 3 else pts)
     return img, out
 
 
@@ -236,7 +230,8 @@ class DatasetBuilder:
             split = split_map.get(video_id, "train")
             data = self.project.load_auto_labels(video_id) or {}
             label_classes = data.get("classes") or classes
-            remap = {i: (0 if i == 0 else class_ids.get(c, i)) for i, c in enumerate(label_classes)}
+            # Map by class name; objects of landmarks no longer in the scene are dropped
+            remap = {i: (0 if i == 0 else class_ids.get(c)) for i, c in enumerate(label_classes)}
             frames_labels = data.get("frames") or []
             path = self.project.resolve_video(video_id)
             reader = VideoReader(str(path), prefer_gstreamer=False)
@@ -254,8 +249,9 @@ class DatasetBuilder:
                     objects = []
                     for cid, poly in objs:
                         pts = np.asarray(poly, dtype=np.float32)
-                        if polygon_area(pts) >= self.min_area * 0.5:
-                            objects.append((remap.get(int(cid), int(cid)), pts))
+                        new_id = remap.get(int(cid))
+                        if new_id is not None and polygon_area(pts) >= self.min_area * 0.5:
+                            objects.append((new_id, pts))
                     if not objects and not is_negative:
                         continue  # only tiny objects — ambiguous frame
                     if not self._accept_frame(frame, split, seen_hashes):

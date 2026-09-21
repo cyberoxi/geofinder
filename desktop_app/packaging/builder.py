@@ -13,9 +13,10 @@ import numpy as np
 
 from desktop_app.project_manager.manager import ProjectManager
 from shared.package_utils import sha256_file, validate_package
-from shared.config import default_runtime_config, save_yaml
-from shared.features import build_reference_bank
+from shared.config import default_runtime_config, load_yaml, save_yaml
+from shared.features import build_reference_bank, effective_feature_method
 from shared.geometry import polygon_area
+from shared.landmarks import json_default
 from shared.schemas import AnnotationSource, Manifest
 from shared.video_reader import VideoReader
 
@@ -42,11 +43,12 @@ class PackageBuilder:
 
         frame, ref_points, ref_meta = self._pick_reference(reference_video_id, reference_frame)
         pts = np.asarray(ref_points, dtype=np.float32)
+        feature_method = effective_feature_method(self.project.meta.feature_method)
         ref_info = build_reference_bank(
             frame,
             pts,
             staging / "reference",
-            feature_method=self.project.meta.feature_method,
+            feature_method=feature_method,
         )
 
         # Models
@@ -80,7 +82,14 @@ class PackageBuilder:
         model_format = "engine" if has_engine else ("onnx" if has_onnx else ("pytorch" if has_pt else "none"))
         runtime = default_runtime_config()
         runtime["yolo"]["mode"] = self.project.meta.model_type
-        runtime["tracking"]["feature_detector"] = self.project.meta.feature_method
+        runtime["tracking"]["feature_detector"] = feature_method
+        # ONNX/TensorRT inputs are static: runtime imgsz must equal the training/export size
+        train_cfg = self.project.runs_dir / "training_config.yaml"
+        if train_cfg.exists():
+            try:
+                runtime["yolo"]["imgsz"] = int(load_yaml(train_cfg).get("imgsz", runtime["yolo"]["imgsz"]))
+            except Exception:  # noqa: BLE001
+                pass
         runtime["yolo"]["model_path"] = "model/model.engine" if has_engine else (
             "model/model.onnx" if has_onnx else "model/best.pt"
         )
@@ -106,7 +115,7 @@ class PackageBuilder:
                 **ref_meta,
                 **ref_info,
             },
-            feature_method=self.project.meta.feature_method,
+            feature_method=feature_method,
             min_confidence=0.45,
             min_iou=0.20,
             class_names=class_names,
@@ -115,7 +124,7 @@ class PackageBuilder:
             has_onnx=has_onnx,
             has_pytorch=has_pt,
         )
-        (staging / "manifest.json").write_text(json.dumps(manifest.to_dict(), indent=2), encoding="utf-8")
+        (staging / "manifest.json").write_text(json.dumps(manifest.to_dict(), indent=2, default=json_default), encoding="utf-8")
 
         readme = f"""# Deployment Package: {self.project.meta.project_name}
 

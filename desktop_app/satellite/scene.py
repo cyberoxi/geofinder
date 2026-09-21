@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,6 +13,9 @@ from shared.landmarks import SceneLayout
 from shared.logging import get_logger
 
 logger = get_logger("desktop.satellite.scene")
+
+if TYPE_CHECKING:  # pragma: no cover
+    from desktop_app.satellite.objects import ObjectCandidate
 
 Rect = Tuple[float, float, float, float]  # x0, y0, x1, y1 (mosaic px)
 
@@ -210,26 +213,116 @@ def discover_landmarks(
     return chosen
 
 
-def build_scene_layout(
-    mosaic: np.ndarray,
-    target: Rect,
+def layout_from_selection(
+    target_polygon: Sequence[Sequence[float]],
+    selected: Sequence["ObjectCandidate"],
+    mosaic_size: Tuple[int, int],
     *,
-    num_landmarks: int = 4,
     target_class: str = "target_region",
     meters_per_px: float = 0.0,
     meta: Optional[dict] = None,
 ) -> SceneLayout:
-    landmarks = discover_landmarks(mosaic, target, k=num_landmarks)
-    classes = [target_class] + [f"landmark_{i + 1}" for i in range(len(landmarks))]
-    polygons = [_rect_poly(target)] + [_rect_poly(r) for r in landmarks]
-    H, W = mosaic.shape[:2]
+    """Scene layout (class 0 = target, 1..K = landmarks) from chosen landmark objects."""
+    meta = dict(meta or {})
+    meta["landmarks"] = [c.to_dict() for c in selected]
     return SceneLayout(
-        classes=classes,
-        polygons=polygons,
-        mosaic_size=(W, H),
+        classes=[target_class] + [f"landmark_{i + 1}_{c.kind}" for i, c in enumerate(selected)],
+        polygons=[[list(map(float, pt)) for pt in target_polygon]]
+        + [[[float(x), float(y)] for x, y in c.polygon] for c in selected],
+        mosaic_size=(int(mosaic_size[0]), int(mosaic_size[1])),
         meters_per_px=meters_per_px,
-        meta=dict(meta or {}),
+        meta=meta,
     )
+
+
+def build_scene(
+    mosaic: np.ndarray,
+    target: Rect,
+    *,
+    num_landmarks: int = 8,
+    target_class: str = "target_region",
+    meters_per_px: float = 0.0,
+    meta: Optional[dict] = None,
+    use_sam: bool = True,
+) -> Tuple[SceneLayout, List["ObjectCandidate"]]:
+    """
+    Detect real landmark objects around the target and pick ``num_landmarks`` of
+    them (near / mid / far).  Returns (layout, all_candidates) — the candidates
+    feed the landmark editor so the user can swap, add or remove landmarks.
+    """
+    from desktop_app.satellite.objects import ObjectCandidate, propose_objects, select_landmarks
+
+    H, W = mosaic.shape[:2]
+    candidates: List[ObjectCandidate] = []
+    try:
+        candidates = propose_objects(mosaic, target, meters_per_px, use_sam=use_sam)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Object proposals failed (%s) — falling back to texture patches", exc)
+    selected = select_landmarks(candidates, target, (W, H), k=num_landmarks)
+    if len(selected) < num_landmarks:
+        # Sparse scenes (desert, farmland): complete with distinctive texture patches
+        taken = [c.bbox() for c in selected]
+        tx0, ty0, tx1, ty1 = target
+        tc = np.array([(tx0 + tx1) / 2, (ty0 + ty1) / 2], np.float32)
+        for r in discover_landmarks(mosaic, target, k=num_landmarks * 2):
+            if len(selected) >= num_landmarks:
+                break
+            if any(_rects_overlap(r, b) for b in taken):
+                continue
+            c = ObjectCandidate(polygon=np.asarray(_rect_poly(r), np.float32), kind="patch", score=0.3)
+            c.distance = float(np.linalg.norm(c.center - tc))
+            selected.append(c)
+            candidates.append(c)
+            taken.append(r)
+    layout = layout_from_selection(
+        _rect_poly(target),
+        selected,
+        (W, H),
+        target_class=target_class,
+        meters_per_px=meters_per_px,
+        meta=meta,
+    )
+    return layout, candidates
+
+
+def build_scene_layout(
+    mosaic: np.ndarray,
+    target: Rect,
+    *,
+    num_landmarks: int = 8,
+    target_class: str = "target_region",
+    meters_per_px: float = 0.0,
+    meta: Optional[dict] = None,
+) -> SceneLayout:
+    return build_scene(
+        mosaic,
+        target,
+        num_landmarks=num_landmarks,
+        target_class=target_class,
+        meters_per_px=meters_per_px,
+        meta=meta,
+    )[0]
+
+
+def save_candidates(path, candidates: Sequence["ObjectCandidate"]) -> None:
+    import json
+    from pathlib import Path as _P
+
+    from shared.landmarks import json_default
+
+    _P(path).write_text(json.dumps([c.to_dict() for c in candidates], default=json_default), encoding="utf-8")
+
+
+def load_candidates(path) -> List["ObjectCandidate"]:
+    import json
+    from pathlib import Path as _P
+
+    from desktop_app.satellite.objects import ObjectCandidate
+
+    p = _P(path)
+    if not p.exists():
+        return []
+    return [ObjectCandidate.from_dict(d) for d in json.loads(p.read_text(encoding="utf-8"))]
 
 
 def draw_scene_preview(mosaic: np.ndarray, layout: SceneLayout, max_side: int = 1400) -> np.ndarray:
