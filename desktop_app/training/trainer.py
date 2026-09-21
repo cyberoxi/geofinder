@@ -51,7 +51,10 @@ class TrainingRunner:
         try:
             from ultralytics import YOLO
         except ImportError as exc:
-            raise RuntimeError("ultralytics is required for training on the desktop") from exc
+            raise RuntimeError(
+                "ultralytics is required for training. "
+                "Install: pip install torch torchvision ultralytics"
+            ) from exc
 
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         cfg = {
@@ -64,6 +67,21 @@ class TrainingRunner:
             "model_type": self.model_type,
         }
         save_yaml(cfg, self.runs_dir / "training_config.yaml")
+
+        if progress_cb:
+            progress_cb({"epoch": 0, "metrics": {}, "status": f"Loading model {self.base_model}…"})
+
+        # Prefer CPU when CUDA device requested but unavailable
+        device = self.device
+        if str(device) not in ("cpu", "mps"):
+            try:
+                import torch
+
+                if not torch.cuda.is_available():
+                    logger.warning("CUDA unavailable; falling back to CPU")
+                    device = "cpu"
+            except Exception:
+                device = "cpu"
 
         model = YOLO(self.base_model)
 
@@ -83,16 +101,20 @@ class TrainingRunner:
                 trainer.stop = True
 
         model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
+        if progress_cb:
+            progress_cb({"epoch": 0, "metrics": {}, "status": f"Training on {device}…"})
+
         results = model.train(
             data=str(self.data_yaml),
             epochs=self.epochs,
             batch=self.batch,
             imgsz=self.imgsz,
-            device=self.device,
+            device=device,
             project=str(self.runs_dir),
             name="train",
             exist_ok=True,
         )
+        _ = results
         best = self.runs_dir / "train" / "weights" / "best.pt"
         if best.exists():
             self.best_weights = best
@@ -100,6 +122,7 @@ class TrainingRunner:
             "best_weights": str(self.best_weights) if self.best_weights else None,
             "last_metrics": self.last_metrics,
             "results_dir": str(self.runs_dir / "train"),
+            "device": device,
         }
         (self.runs_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return summary

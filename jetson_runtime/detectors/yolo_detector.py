@@ -39,6 +39,7 @@ class YOLODetector:
         warmup_iterations: int = 5,
         class_names: Optional[List[str]] = None,
         fallback_paths: Optional[List[str]] = None,
+        localizer: Optional[Any] = None,
     ):
         self.mode = mode.lower()
         self.device_pref = device
@@ -57,6 +58,11 @@ class YOLODetector:
         self.available = False
         self._model_path = model_path
         self._fallback_paths = fallback_paths or []
+        # Landmark-based target localization (shared.landmarks.TargetLocalizer)
+        self.localizer = localizer
+        self.last_all_detections: List[Detection] = []
+        self.last_localization: Optional[Any] = None
+        self.predict_count = 0
         self._load_model()
 
     def _resolve_path(self) -> Optional[Path]:
@@ -196,11 +202,8 @@ class YOLODetector:
         if self.mode == "segmentation" and masks is not None and masks.data is not None:
             mask_data = masks.data.cpu().numpy()
 
+        all_dets: List[Detection] = []
         for i, (box, conf, cls_id) in enumerate(zip(xyxy, confs, clss)):
-            if int(cls_id) != int(self.target_class) and self.target_class >= 0:
-                # If model is single-class custom, still accept class 0 mismatches lightly
-                if len(self.class_names) > 1:
-                    continue
             x1, y1, x2, y2 = map(float, box)
             det = Detection(
                 bbox=(x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)),
@@ -217,8 +220,45 @@ class YOLODetector:
                 roi = ROI.from_mask(binary)
                 if roi is not None:
                     det.polygon = roi.points
-            detections.append(det)
-        return detections
+            all_dets.append(det)
+        return self._finalize(all_dets, frame.shape)
+
+    def _finalize(self, all_dets: List[Detection], frame_shape) -> List[Detection]:
+        """Keep target detections; if none, infer the target from visible landmarks."""
+        self.predict_count += 1
+        self.last_all_detections = all_dets
+        self.last_localization = None
+        multi = len(self.class_names) > 1
+        if not multi or self.target_class < 0:
+            return all_dets
+        targets = [d for d in all_dets if d.class_id == int(self.target_class)]
+        if self.localizer is None:
+            return targets
+        best_target = max((d.confidence for d in targets), default=0.0)
+        est = self.localizer.estimate(all_dets, frame_shape)
+        self.last_localization = est
+        if est is None or not est.in_view:
+            return targets
+        if best_target >= self.confidence_threshold:
+            return targets
+        poly = est.polygon.astype(np.float32)
+        x0, y0 = float(poly[:, 0].min()), float(poly[:, 1].min())
+        x1, y1 = float(poly[:, 0].max()), float(poly[:, 1].max())
+        synth = Detection(
+            bbox=(x0, y0, x1 - x0, y1 - y0),
+            confidence=max(est.confidence, self.confidence_threshold if len(est.landmarks_used) >= 2 else 0.0),
+            class_id=int(self.target_class),
+            polygon=poly,
+            source="landmarks",
+        )
+        logger.debug(
+            "Target inferred from landmarks %s conf=%.2f scale=%.3f angle=%.1f",
+            est.landmarks_used,
+            synth.confidence,
+            est.scale,
+            est.angle_deg,
+        )
+        return targets + [synth]
 
     def detection_to_roi(self, det: Detection, frame_index: int = 0) -> ROI:
         if det.polygon is not None and len(det.polygon) >= 3:

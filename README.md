@@ -61,6 +61,20 @@ pip install -r requirements-jetson.txt
 7. **Export ONNX** — `runs/model.onnx` or `tools/export_onnx.py`.
 8. **Build Jetson Package** — ZIP with manifest, reference bank (AKAZE), checksums, runtime.yaml.
 
+### Satellite synthetic video (optional)
+
+Generate zoom-flyover and/or pan clips from **Esri World Imagery** tiles (no API key). Useful for demos and pipeline smoke tests — **not** a substitute for real drone footage in production tracking.
+
+**GUI:** open a project → **Tools → Generate Satellite Video…** → search a place and/or pan/zoom → toggle **Satellite / Map** → **Select Region** and drag a box (this is the *end* of the zoom) → optionally raise **Zoom depth (×)** (default 12) so the clip starts farther out → **Generate Video**. Clips go under `exports/satellite/` and into the project video list.
+
+**CLI:**
+
+```bash
+python tools/satellite_video.py --lat 35.6892 --lon 51.3890 --span 0.02 --modes both --out data/output
+```
+
+Outputs `satellite_zoom.mp4`, `satellite_pan.mp4`, and `satellite_mosaic.jpg`. Tiles cache under `data/satellite_cache/`. Attribution: Esri World Imagery.
+
 ### Dataset layout
 
 ```text

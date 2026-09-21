@@ -237,6 +237,8 @@ class Manifest:
     has_engine: bool = False
     has_onnx: bool = True
     has_pytorch: bool = False
+    # Relative path of the landmark scene layout (target + landmarks in mosaic px)
+    scene_layout: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -253,6 +255,7 @@ class Detection:
     class_id: int = 0
     polygon: Optional[np.ndarray] = None
     mask: Optional[np.ndarray] = None
+    source: str = "yolo"  # "yolo" or "landmarks" (target inferred from landmark geometry)
 
 
 @dataclass

@@ -53,6 +53,14 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         logger.warning("No model in package — feature/homography-only mode")
         return None
     fallbacks = [str(p) for p in (onnx, pt) if p and str(p) != model_path]
+    localizer = None
+    scene_rel = getattr(loader.manifest, "scene_layout", "") if loader.manifest else ""
+    if scene_rel and loader.root is not None and (loader.root / scene_rel).exists():
+        from shared.landmarks import SceneLayout, TargetLocalizer
+
+        layout = SceneLayout.load(loader.root / scene_rel)
+        localizer = TargetLocalizer(layout)
+        logger.info("Landmark localizer enabled (%d landmarks)", layout.num_landmarks)
     return YOLODetector(
         model_path=model_path,
         mode=ycfg.get("mode", loader.manifest.model_type if loader.manifest else "segmentation"),
@@ -64,7 +72,40 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         warmup_iterations=int(ycfg.get("warmup_iterations", 5)),
         class_names=list(loader.manifest.class_names) if loader.manifest else ["target_region"],
         fallback_paths=fallbacks,
+        localizer=localizer,
     )
+
+
+def draw_landmarks(frame, yolo: Optional[YOLODetector]) -> None:
+    """Overlay landmark detections and the landmark-inferred target (in place)."""
+    import cv2
+    import numpy as np
+
+    if yolo is None:
+        return
+    names = yolo.class_names
+    for d in yolo.last_all_detections:
+        if d.class_id == yolo.target_class:
+            continue
+        x, y, w, h = map(int, d.bbox)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 160, 255), 2)
+        label = names[d.class_id] if 0 <= d.class_id < len(names) else str(d.class_id)
+        cv2.putText(frame, f"{label} {d.confidence:.2f}", (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 160, 255), 1, cv2.LINE_AA)
+    est = yolo.last_localization
+    if est is not None:
+        pts = np.round(est.polygon).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [pts], True, (255, 0, 255), 2, cv2.LINE_AA)
+        if not est.in_view:
+            # Arrow from frame centre toward the off-screen target
+            h, w = frame.shape[:2]
+            c = np.array([w / 2, h / 2])
+            t = est.polygon.mean(axis=0)
+            v = t - c
+            n = np.linalg.norm(v)
+            if n > 1:
+                tip = c + v / n * min(n, 0.4 * min(w, h))
+                cv2.arrowedLine(frame, tuple(map(int, c)), tuple(map(int, tip)), (255, 0, 255), 3, tipLength=0.2)
+                cv2.putText(frame, "target", tuple(map(int, tip)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
 
 def run_runtime(
@@ -125,6 +166,7 @@ def run_runtime(
             logger.warning("Initial search failed; continuing with SEARCHING state")
 
     processed = 0
+    last_predict = -1
     fps_list = []
     t0 = time.perf_counter()
     idx = 0
@@ -143,6 +185,9 @@ def run_runtime(
         result = tracker.to_frame_result(idx, source.reader.timestamp_of(idx), process_fps=fps)
         exporter.add_result(result)
         annotated = draw_overlay(frame, result, trail=state.trail)
+        if yolo is not None and yolo.predict_count != last_predict:
+            draw_landmarks(annotated, yolo)
+            last_predict = yolo.predict_count
         exporter.write_frame(annotated)
         if state.status == RuntimeState.LOST and loader.runtime_config.get("export", {}).get("save_failed_frames", True):
             exporter.save_failed_frame(frame, idx)

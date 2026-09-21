@@ -54,6 +54,7 @@ try:
         QSizePolicy,
         QListWidget,
         QInputDialog,
+        QProgressBar,
     )
 
     QT_API = "PySide6"
@@ -115,6 +116,7 @@ except ImportError:  # pragma: no cover
         QAction,
         QListWidget,
         QInputDialog,
+        QProgressBar,
     )
 
     QT_API = "PyQt5"

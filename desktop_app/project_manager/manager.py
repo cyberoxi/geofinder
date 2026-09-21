@@ -50,6 +50,8 @@ class ProjectManager:
         self.runs_dir = self.root / "runs"
         self.packages_dir = self.root / "packages"
         self.exports_dir = self.root / "exports"
+        self.auto_labels_dir = self.root / "auto_labels"
+        self.scene_dir = self.root / "scene"
         self.meta: Optional[ProjectMeta] = None
         self._conn: Optional[sqlite3.Connection] = None
 
@@ -126,6 +128,51 @@ class ProjectManager:
         self.meta.videos.append(asset)
         self.save_meta()
         return asset
+
+    # ------------------------------------------------------------ auto labels / scene
+
+    @property
+    def scene_path(self) -> Path:
+        return self.scene_dir / "scene.json"
+
+    def set_scene(self, scene_json: str | Path, preview: str | Path | None = None, mosaic: str | Path | None = None) -> Path:
+        """Install the scene layout (target + landmarks) used for multi-class training."""
+        self.scene_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(scene_json, self.scene_path)
+        if preview and Path(preview).exists():
+            shutil.copy2(preview, self.scene_dir / "scene_preview.jpg")
+        if mosaic and Path(mosaic).exists():
+            shutil.copy2(mosaic, self.scene_dir / "mosaic.jpg")
+        return self.scene_path
+
+    def scene_layout(self):
+        from shared.landmarks import SceneLayout
+
+        return SceneLayout.load(self.scene_path) if self.scene_path.exists() else None
+
+    def class_names(self) -> List[str]:
+        target = self.meta.target_class if self.meta else "target_region"
+        layout = self.scene_layout()
+        if layout is None:
+            return [target]
+        return [target] + list(layout.classes[1:])
+
+    def attach_auto_labels(self, video_id: str, labels_json: str | Path) -> Path:
+        self.auto_labels_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.auto_labels_dir / f"{video_id}.json"
+        shutil.copy2(labels_json, dest)
+        return dest
+
+    def auto_labels_path(self, video_id: str) -> Optional[Path]:
+        p = self.auto_labels_dir / f"{video_id}.json"
+        return p if p.exists() else None
+
+    def load_auto_labels(self, video_id: str) -> Optional[Dict[str, Any]]:
+        p = self.auto_labels_path(video_id)
+        if p is None:
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def resolve_video(self, video_id: str) -> Path:
         if self.meta is None:
