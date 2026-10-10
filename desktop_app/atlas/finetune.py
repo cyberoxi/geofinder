@@ -152,7 +152,7 @@ def prepare_subregion_project(
     project_dir: str | Path,
     *,
     project_name: str = "",
-    n_videos: int = 3,
+    n_videos: int = 6,
     zoom_out_factor: float = 10.0,
     night_fraction: float = 0.2,
     ir_fraction: float = 0.1,

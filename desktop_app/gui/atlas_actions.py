@@ -79,7 +79,18 @@ class AtlasActionsMixin:
     def build_region_atlas(self):
         if self._atlas_busy():
             return
-        dlg = AtlasBuildDialog(self, model_type=self.model_type.currentText(), imgsz=self.imgsz.value())
+        if not self.project:
+            QMessageBox.information(
+                self, "Region Atlas",
+                "Open or create a project first.\nAtlas files are created inside that project folder.",
+            )
+            return
+        dlg = AtlasBuildDialog(
+            self,
+            project_dir=self.project.root,
+            model_type=self.model_type.currentText(),
+            imgsz=self.imgsz.value(),
+        )
         if qt_exec(dlg) != QDialog.Accepted or not dlg.result:
             return
         atlas: RegionAtlas = dlg.result["atlas"]

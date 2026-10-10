@@ -110,6 +110,12 @@ def _split_videos(video_ids: List[str], seed: int = 42) -> Dict[str, str]:
     return mapping
 
 
+def _frame_split(fid: int, video_index: int, block: int = 16) -> str:
+    """Interleaved frame-block split (~70/20/10) — every video (and class) also lands in train."""
+    k = (fid // block + video_index) % 10
+    return "val" if k in (2, 7) else "test" if k == 5 else "train"
+
+
 class DatasetBuilder:
     def __init__(
         self,
@@ -123,6 +129,7 @@ class DatasetBuilder:
         class_name: str = "target_region",
         auto_every_n: int = 3,
         negative_ratio: float = 0.15,
+        split_mode: Optional[str] = None,
     ):
         self.project = project
         self.model_type = model_type
@@ -134,6 +141,9 @@ class DatasetBuilder:
         self.class_name = class_name
         self.auto_every_n = max(1, auto_every_n)
         self.negative_ratio = negative_ratio
+        # "video" = whole videos per split; "frames" = frame blocks of each auto-labeled video.
+        # Default: frames for region-atlas projects (few videos, landmarks seen in only one chunk).
+        self.split_mode = split_mode
 
     def build(
         self,
@@ -184,7 +194,10 @@ class DatasetBuilder:
             )
 
         video_ids = sorted({a.video_id for a in by_vf.values()} | set(auto_videos))
+        split_mode = self.split_mode or ("frames" if self.project.meta.settings.get("atlas") else "video")
         split_map = _split_videos(video_ids)
+        if split_mode == "frames":
+            split_map.update({v: "frames" for v in auto_videos})
         rng = random.Random(42)
         seen_hashes: Dict[str, set] = {"train": set(), "val": set(), "test": set()}
         counts = {"train": 0, "val": 0, "test": 0}
@@ -227,7 +240,7 @@ class DatasetBuilder:
                 reader.release()
 
         for vi, video_id in enumerate(auto_videos):
-            split = split_map.get(video_id, "train")
+            video_split = split_map.get(video_id, "train")
             data = self.project.load_auto_labels(video_id) or {}
             label_classes = data.get("classes") or classes
             # Map by class name; objects of landmarks no longer in the scene are dropped
@@ -240,6 +253,7 @@ class DatasetBuilder:
                     ok, frame = reader.read()
                     if not ok or frame is None:
                         break
+                    split = _frame_split(fid, vi) if video_split == "frames" else video_split
                     is_negative = not objs
                     step = self.auto_every_n * (2 if is_negative else 1)
                     if fid % step != 0:
@@ -254,7 +268,8 @@ class DatasetBuilder:
                             objects.append((new_id, pts))
                     if not objects and not is_negative:
                         continue  # only tiny objects — ambiguous frame
-                    if not self._accept_frame(frame, split, seen_hashes):
+                    # Rendered night / IR / blurred frames are intentional — skip the sharpness filter
+                    if not self._accept_frame(frame, split, seen_hashes, check_blur=False):
                         continue
                     if not objects:
                         negatives[split] += 1
@@ -296,9 +311,11 @@ class DatasetBuilder:
             progress_cb(f"Done — {sum(counts.values())} samples → {out}")
         return out
 
-    def _accept_frame(self, frame: np.ndarray, split: str, seen_hashes: Dict[str, set]) -> bool:
+    def _accept_frame(
+        self, frame: np.ndarray, split: str, seen_hashes: Dict[str, set], check_blur: bool = True
+    ) -> bool:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if _laplacian_var(gray) < self.min_blur_var:
+        if check_blur and _laplacian_var(gray) < self.min_blur_var:
             return False
         ph = _phash(gray)
         if self.dedupe and ph in seen_hashes[split]:

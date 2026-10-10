@@ -63,9 +63,16 @@ def restore_map_view(panel: SatelliteMapPanel) -> None:
 
 
 class AtlasBuildDialog(QDialog):
-    """Select a large region → atlas folder + build options. ``result`` = {"atlas", "epochs", ...}."""
+    """Select a large region → atlas under the open project. ``result`` = {"atlas", "epochs", ...}."""
 
-    def __init__(self, parent=None, *, model_type: str = "segmentation", imgsz: int = 640):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        project_dir: str | Path,
+        model_type: str = "segmentation",
+        imgsz: int = 640,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Build Region Base Model / ساخت مدل پایه منطقه")
         self.setMinimumSize(980, 620)
@@ -73,6 +80,7 @@ class AtlasBuildDialog(QDialog):
         self.result: Optional[Dict[str, Any]] = None
         self._resume: Optional[RegionAtlas] = None
         self._imgsz = imgsz
+        self._project_dir = Path(project_dir).resolve()
 
         root = QHBoxLayout(self)
         self.map_panel = SatelliteMapPanel()
@@ -86,7 +94,8 @@ class AtlasBuildDialog(QDialog):
             "landmarks across the whole area and trains one base model. Later, "
             "<b>Fine-tune Sub-region</b> trains any target inside this area in a fraction of the time.<br>"
             "<span style='color:#aaa'>یک منطقه بزرگ انتخاب کنید؛ مدل پایه کل منطقه را یاد می‌گیرد و "
-            "بعداً هر هدف داخل آن سریع ری‌فاین می‌شود.</span>"
+            "بعداً هر هدف داخل آن سریع ری‌فاین می‌شود.</span><br>"
+            f"<span style='color:#8af'>Output under project: {self._project_dir}</span>"
         )
         intro.setWordWrap(True)
         sv.addWidget(intro)
@@ -94,14 +103,6 @@ class AtlasBuildDialog(QDialog):
         form = QFormLayout()
         self.name = QLineEdit("region_atlas")
         form.addRow("Atlas name", self.name)
-        folder_row = QHBoxLayout()
-        self.folder = QLineEdit(str(Path.cwd() / "atlases"))
-        b_browse = QPushButton("…")
-        b_browse.setFixedWidth(32)
-        b_browse.clicked.connect(self._browse_folder)
-        folder_row.addWidget(self.folder, stretch=1)
-        folder_row.addWidget(b_browse)
-        form.addRow("Parent folder", folder_row)
 
         self.layer = QComboBox()
         for key, title in mosaic_layers().items():
@@ -172,11 +173,6 @@ class AtlasBuildDialog(QDialog):
         restore_map_view(self.map_panel)
 
     # ------------------------------------------------------------ helpers
-    def _browse_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Parent folder for atlases", self.folder.text())
-        if d:
-            self.folder.setText(d)
-
     def _options(self) -> AtlasBuildOptions:
         night = self.night.isChecked()
         return AtlasBuildOptions(
@@ -207,7 +203,7 @@ class AtlasBuildDialog(QDialog):
         )
 
     def _pick_resume(self) -> None:
-        start = str(recent_atlases()[0]) if recent_atlases() else self.folder.text()
+        start = str(recent_atlases()[0]) if recent_atlases() else str(self._project_dir)
         path, _ = QFileDialog.getOpenFileName(self, "Open atlas", start, f"Atlas ({ATLAS_FILE})")
         if not path:
             return
@@ -218,10 +214,9 @@ class AtlasBuildDialog(QDialog):
             return
         self._resume = atlas
         self.name.setText(atlas.name)
-        self.folder.setText(str(atlas.root.parent))
         self.zoom.setValue(atlas.zoom)
         self.model_type.setCurrentText(atlas.model_type)
-        for w in (self.name, self.folder, self.zoom, self.layer, self.lm_per_chunk, self.max_lm, self.videos,
+        for w in (self.name, self.zoom, self.layer, self.lm_per_chunk, self.max_lm, self.videos,
                   self.night, self.use_sam, self.model_type):
             w.setEnabled(False)
         s, w_, n, e = atlas.swne
@@ -240,7 +235,7 @@ class AtlasBuildDialog(QDialog):
             QMessageBox.warning(self, "Atlas", "Select the large area on the map first (Select Region).")
             return
         name = re.sub(r"[^\w.-]+", "_", self.name.text().strip(), flags=re.UNICODE) or "region_atlas"
-        root = Path(self.folder.text().strip() or ".") / name
+        root = self._project_dir / name
         if (root / ATLAS_FILE).exists():
             QMessageBox.warning(
                 self, "Atlas", f"An atlas already exists in\n{root}\n\nChoose another name or use Resume."

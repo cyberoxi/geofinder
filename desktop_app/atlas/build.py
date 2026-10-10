@@ -343,10 +343,18 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
         per = [opts.videos_per_chunk // len(focuses)] * len(focuses)
         for j in range(opts.videos_per_chunk - sum(per)):
             per[j % len(per)] += 1
+        # Night / IR counts per chunk (rounding per focus would make half the videos night)
+        n_night = int(round(opts.night_fraction * opts.videos_per_chunk))
+        n_ir = int(round(opts.ir_fraction * opts.videos_per_chunk))
+        lights = [[0, 0] for _ in focuses]
+        for k in range(n_night + n_ir):
+            fi = (len(focuses) - 1 - k) % len(focuses)
+            lights[fi][0 if k < n_night else 1] += 1
         videos: List[Dict[str, str]] = []
         for fi, (focus, nv) in enumerate(zip(focuses, per)):
             if nv <= 0:
                 continue
+            night_f, ir_f = (min(1.0, c / nv) for c in lights[fi])
             layout, keep = chunk_layout(atlas, chunk, mosaic, focus, focus_size)
 
             def _p(d: int, t: int, msg: str, idx: int = idx, fi: int = fi) -> None:
@@ -356,7 +364,7 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
 
             res = render_scene_videos(
                 mosaic, layout, atlas.chunk_dir(chunk["id"]) / f"videos_{fi}",
-                n_videos=nv, night_fraction=opts.night_fraction, ir_fraction=opts.ir_fraction,
+                n_videos=nv, night_fraction=night_f, ir_fraction=ir_f,
                 duration_s=opts.duration_s, fps=opts.fps, seed=int(chunk["id"]) * 17 + fi,
                 keep_classes=keep, progress_cb=_p,
             )

@@ -251,7 +251,11 @@ class AutoPipeline:
     def _evaluate(self, pm: ProjectManager, best: str, split_map: Dict[str, str], device: str) -> list:
         from desktop_app.inference.localize import run_on_video
 
-        held_out = [v for v, s in split_map.items() if s == "test"] or [v for v, s in split_map.items() if s == "val"]
+        held_out = (
+            [v for v, s in split_map.items() if s == "test"]
+            or [v for v, s in split_map.items() if s == "val"]
+            or [v for v, s in split_map.items() if s == "frames"]  # frame-block split: partly seen
+        )
         held_out = [v for v in held_out if pm.auto_labels_path(v) is not None][:2]
         results = []
         for k, vid in enumerate(held_out):

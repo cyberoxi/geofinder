@@ -83,7 +83,7 @@ class AtlasFinetuneDialog(QDialog):
         form.addRow("Projects folder", folder_row)
         self.n_videos = QSpinBox()
         self.n_videos.setRange(1, 12)
-        self.n_videos.setValue(3)
+        self.n_videos.setValue(6)
         form.addRow("Videos", self.n_videos)
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 300)

@@ -1024,9 +1024,15 @@ class SatelliteMapWidget(QLabel):
 
         mpp = meters_per_pixel(self.center_lat, self.zoom)
         alt = eye_altitude_m(self.center_lat, self.zoom)
-        alt_line = f"ارتفاع از زمین ≈ {format_altitude_m(alt)}"
+        # LTR isolate keeps "11.1 km" together inside RTL Persian lines (BiDi).
+        ltr = "\u2066"
+        pdi = "\u2069"
+        alt_line = f"ارتفاع از زمین ≈ {ltr}{format_altitude_m(alt)}{pdi}"
         if self._ground_elev_m is not None:
-            ground_line = f"ارتفاع سطح زمین: {format_altitude_m(self._ground_elev_m, prefer_meters=True)}"
+            ground_line = (
+                f"ارتفاع سطح زمین: {ltr}"
+                f"{format_altitude_m(self._ground_elev_m, prefer_meters=True)}{pdi}"
+            )
         else:
             ground_line = "ارتفاع سطح زمین: در حال دریافت…"
         gsd_line = f"{mpp:.2f} m/px" if mpp >= 0.1 else f"{mpp:.3f} m/px"
