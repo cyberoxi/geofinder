@@ -48,6 +48,7 @@ from shared.qt_compat import (
     qt_exec,
 )
 from shared.video_reader import VideoReader
+from jetson_runtime.gui.camera_test_dialog import open_camera_test
 from jetson_runtime.gui.serial_dialog import edit_serial_settings, load_serial_settings
 from jetson_runtime.gui.source_dialog import choose_input_source
 from jetson_runtime.runtime.pipeline import run_runtime
@@ -122,6 +123,14 @@ class JetsonMainWindow(QMainWindow):
         m.addAction(self._tb_action("Input Source…", "open", self.choose_input))
         m.addAction(self._tb_action("Open Video File…", "open", self.open_video))
         m.addAction(
+            self._tb_action(
+                "Camera Test…",
+                "add_video",
+                self.test_camera,
+                "Start CSI/USB camera and show live preview",
+            )
+        )
+        m.addAction(
             QAction(
                 "Open RTSP…",
                 self,
@@ -148,6 +157,14 @@ class JetsonMainWindow(QMainWindow):
                 "open",
                 self.choose_input,
                 "Video file / IMX477 CSI / USB webcam",
+            )
+        )
+        tb.addAction(
+            self._tb_action(
+                "Cam Test",
+                "add_video",
+                self.test_camera,
+                "Start camera and show live preview",
             )
         )
         tb.addSeparator()
@@ -194,6 +211,7 @@ class JetsonMainWindow(QMainWindow):
             ("Import Package", "package", self.import_package),
             ("Scan USB", "usb", self.scan_usb_now),
             ("Input Source", "open", self.choose_input),
+            ("Camera Test", "add_video", self.test_camera),
             ("Serial settings", "settings", self.open_serial_settings),
             ("Start Processing", "run", self.start),
             ("Stop Processing", "stop_proc", self.stop),
@@ -342,6 +360,27 @@ class JetsonMainWindow(QMainWindow):
 
     def choose_input(self):
         spec = choose_input_source(self, initial=self.input_spec)
+        if spec is None:
+            return
+        self._apply_input_spec(spec)
+
+    def test_camera(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                "Camera Test",
+                "Stop processing before testing the camera.\n"
+                "قبل از تست دوربین، پردازش را متوقف کنید.",
+            )
+            return
+        # Release any open file reader so the camera can claim the device.
+        if self.reader:
+            self.reader.release()
+            self.reader = None
+        initial = self.input_spec
+        if initial is not None and initial.kind == KIND_FILE:
+            initial = None
+        spec = open_camera_test(self, initial=initial)
         if spec is None:
             return
         self._apply_input_spec(spec)

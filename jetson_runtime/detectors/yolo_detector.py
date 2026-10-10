@@ -61,6 +61,7 @@ class YOLODetector:
         self.available = False
         self._model_path = model_path
         self._fallback_paths = fallback_paths or []
+        self._half = False
         # Landmark-based target localization (shared.landmarks.TargetLocalizer)
         self.localizer = localizer
         if localizer is not None:
@@ -128,6 +129,9 @@ class YOLODetector:
                 self.backend = "onnx"
             else:
                 self.backend = "pytorch"
+            # ONNX/TensorRT precision is baked into the exported model; forcing half on an
+            # FP32 ONNX makes older Ultralytics feed FP16 input and every predict fails silently.
+            self._half = self.use_fp16 and self.device != "cpu" and self.backend == "pytorch"
             self.available = True
             self.load_ms = (time.perf_counter() - t0) * 1000.0
             logger.info(
@@ -165,7 +169,7 @@ class YOLODetector:
                     conf=self.confidence_threshold,
                     iou=self.iou_threshold,
                     device=self.device,
-                    half=self.use_fp16 and self.device != "cpu",
+                    half=self._half,
                     verbose=False,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -184,7 +188,7 @@ class YOLODetector:
                 conf=self.predict_conf,
                 iou=self.iou_threshold,
                 device=self.device,
-                half=self.use_fp16 and self.device != "cpu",
+                half=self._half,
                 verbose=False,
             )
         except Exception as exc:  # noqa: BLE001

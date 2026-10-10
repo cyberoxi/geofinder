@@ -63,23 +63,15 @@ class PackageBuilder:
             shutil.copy2(weights_engine, staging / "model" / "model.engine")
             has_engine = True
 
-        # Auto-pick from runs if not provided
+        # Auto-pick from runs if not provided: the newest best.pt (same weights Live Test uses)
+        best_pt = Path(weights_pt) if has_pt else None
         if not has_pt:
-            candidates = list(self.project.runs_dir.glob("**/weights/best.pt"))
+            candidates = sorted(self.project.runs_dir.glob("**/weights/best.pt"), key=lambda p: p.stat().st_mtime)
             if candidates:
-                shutil.copy2(candidates[-1], staging / "model" / "best.pt")
+                best_pt = candidates[-1]
+                shutil.copy2(best_pt, staging / "model" / "best.pt")
                 has_pt = True
-        if not has_onnx:
-            candidates = list(self.project.runs_dir.glob("**/*.onnx")) + list(self.project.root.glob("**/*.onnx"))
-            # Prefer project-local non-package
-            for c in candidates:
-                if "packages" in c.parts:
-                    continue
-                shutil.copy2(c, staging / "model" / "model.onnx")
-                has_onnx = True
-                break
 
-        model_format = "engine" if has_engine else ("onnx" if has_onnx else ("pytorch" if has_pt else "none"))
         runtime = default_runtime_config()
         runtime["yolo"]["mode"] = self.project.meta.model_type
         runtime["tracking"]["feature_detector"] = feature_method
@@ -90,6 +82,16 @@ class PackageBuilder:
                 runtime["yolo"]["imgsz"] = int(load_yaml(train_cfg).get("imgsz", runtime["yolo"]["imgsz"]))
             except Exception:  # noqa: BLE001
                 pass
+
+        if not has_onnx and best_pt is not None:
+            # Jetson prefers ONNX over best.pt, so an ONNX left over from an older training run
+            # would silently replace the freshly trained model. Only ship one that matches best.pt.
+            onnx = self._fresh_onnx(best_pt, int(runtime["yolo"]["imgsz"]))
+            if onnx is not None:
+                shutil.copy2(onnx, staging / "model" / "model.onnx")
+                has_onnx = True
+
+        model_format = "engine" if has_engine else ("onnx" if has_onnx else ("pytorch" if has_pt else "none"))
         runtime["yolo"]["model_path"] = "model/model.engine" if has_engine else (
             "model/model.onnx" if has_onnx else "model/best.pt"
         )
@@ -123,7 +125,7 @@ class PackageBuilder:
                 **ref_info,
             },
             feature_method=feature_method,
-            min_confidence=0.45,
+            min_confidence=self._live_test_confidence(),
             min_iou=0.20,
             class_names=class_names,
             scene_layout=scene_rel,
@@ -173,6 +175,31 @@ python3 tools/build_tensorrt.py --onnx model/model.onnx --output model/model.eng
                     # Ensure no absolute paths in archive
                     zf.write(path, arcname=path.relative_to(staging).as_posix())
         return zip_path
+
+    def _fresh_onnx(self, best_pt: Path, imgsz: int) -> Optional[Path]:
+        """ONNX exported from ``best_pt`` (re-exported if the existing one is older); None on failure."""
+        pt_mtime = best_pt.stat().st_mtime
+        candidates = [best_pt.with_suffix(".onnx"), self.project.runs_dir / "model.onnx"]
+        for c in candidates:
+            if c.exists() and c.stat().st_mtime >= pt_mtime:
+                return c
+        try:
+            from desktop_app.training.trainer import TrainingRunner
+
+            runner = TrainingRunner(self.project.datasets_dir / "x", self.project.runs_dir, imgsz=imgsz)
+            return runner.export_onnx(best_pt, self.project.runs_dir / "model.onnx")
+        except Exception:  # noqa: BLE001 — no ONNX: Jetson runs best.pt directly
+            return None
+
+    @staticmethod
+    def _live_test_confidence() -> float:
+        """Min confidence set in Live Test, so Jetson filters exactly like the desktop test."""
+        try:
+            from desktop_app.gui.live_test_dialog import _load_conf_pct
+
+            return _load_conf_pct() / 100.0
+        except Exception:  # noqa: BLE001 — no Qt available
+            return 0.35
 
     def _pick_reference(
         self, reference_video_id: Optional[str], reference_frame: Optional[int]

@@ -49,15 +49,22 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         from shared.landmarks import SceneLayout, TargetLocalizer
 
         layout = SceneLayout.load(loader.root / scene_rel)
-        localizer = TargetLocalizer(layout)
-        logger.info("Landmark localizer enabled (%d landmarks)", layout.num_landmarks)
+        n_classes = len(loader.manifest.class_names) if loader.manifest else 0
+        if n_classes and len(layout.classes) != n_classes:
+            # Same guard as the desktop Live Test: mismatched class ids would misplace the target
+            logger.warning("Landmarks off: scene has %d classes, model %d", len(layout.classes), n_classes)
+        else:
+            localizer = TargetLocalizer(layout)
+            logger.info("Landmark localizer enabled (%d landmarks)", layout.num_landmarks)
     return YOLODetector(
         model_path=model_path,
         mode=ycfg.get("mode", loader.manifest.model_type if loader.manifest else "segmentation"),
         device=ycfg.get("device", "cuda"),
         imgsz=int(ycfg.get("imgsz", loader.manifest.input_size if loader.manifest else 640)),
         confidence_threshold=float(loader.manifest.min_confidence if loader.manifest else 0.45),
-        iou_threshold=float(loader.manifest.min_iou if loader.manifest else 0.2),
+        # NMS IoU — same as the desktop Live Test (Ultralytics default). manifest.min_iou is a
+        # tracking threshold; using it for NMS (0.2) suppressed valid overlapping detections.
+        iou_threshold=float(ycfg.get("nms_iou", 0.7)),
         use_fp16=bool(ycfg.get("use_fp16", True)),
         warmup_iterations=int(ycfg.get("warmup_iterations", 5)),
         class_names=list(loader.manifest.class_names) if loader.manifest else ["target_region"],
