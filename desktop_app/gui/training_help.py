@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from typing import Dict
 
 from shared.qt_compat import (
@@ -15,9 +16,6 @@ from shared.qt_compat import (
     Qt,
     qt_exec,
 )
-
-# Unicode BiDi: force RTL even when text starts with a Latin token (Epochs, GPU, …)
-_RLI, _PDI = "\u2067", "\u2069"
 
 HELP: Dict[str, Dict[str, str]] = {
     "model_type": {
@@ -109,12 +107,13 @@ HELP: Dict[str, Dict[str, str]] = {
 }
 
 
-def _force_rtl(text: str) -> str:
-    if not text:
-        return text
-    if text.startswith(_RLI):
-        return text
-    return f"{_RLI}{text}{_PDI}"
+def _rtl_html(text: str) -> str:
+    """HTML block that keeps Persian help fully right-aligned (RTL)."""
+    escaped = html.escape(text or "").replace("\n", "<br>")
+    return (
+        '<div dir="rtl" style="text-align:right; direction:rtl;'
+        f'unicode-bidi:embed;">{escaped}</div>'
+    )
 
 
 def make_setting_label(parent: QWidget, text: str, help_key: str) -> QWidget:
@@ -146,6 +145,7 @@ def show_training_help(parent: QWidget, key: str) -> None:
     if not info:
         return
     dlg = QDialog(parent)
+    dlg.setLayoutDirection(Qt.RightToLeft)
     dlg.setWindowTitle(info["title"])
     dlg.setMinimumWidth(420)
     dlg.setMaximumWidth(520)
@@ -153,24 +153,32 @@ def show_training_help(parent: QWidget, key: str) -> None:
     root.setContentsMargins(16, 14, 16, 12)
     root.setSpacing(12)
 
-    title = QLabel(_force_rtl(info["title"]))
+    title = QLabel()
     title.setLayoutDirection(Qt.RightToLeft)
     title.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    title.setStyleSheet("font-weight:700;font-size:14px;color:#e2e8f0;")
+    title.setWordWrap(True)
+    title.setTextFormat(Qt.RichText)
+    title.setText(
+        '<div dir="rtl" style="text-align:right;font-weight:700;font-size:14px;'
+        f'color:#e2e8f0;">{html.escape(info["title"])}</div>'
+    )
     root.addWidget(title)
 
-    body = QLabel(_force_rtl(info["body"]))
+    body = QLabel()
     body.setLayoutDirection(Qt.RightToLeft)
     body.setAlignment(Qt.AlignRight | Qt.AlignTop)
     body.setWordWrap(True)
+    body.setTextFormat(Qt.RichText)
     body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    body.setText(_rtl_html(info["body"]))
     body.setStyleSheet(
-        "color:#cbd5e1;font-size:13px;line-height:1.45;"
-        "background:#0f172a;border:1px solid #243041;border-radius:8px;padding:12px;"
+        "QLabel{color:#cbd5e1;font-size:13px;"
+        "background:#0f172a;border:1px solid #243041;border-radius:8px;padding:12px;}"
     )
     root.addWidget(body)
 
     box = QDialogButtonBox(QDialogButtonBox.Ok)
+    box.setLayoutDirection(Qt.RightToLeft)
     box.accepted.connect(dlg.accept)
     root.addWidget(box)
     qt_exec(dlg)
