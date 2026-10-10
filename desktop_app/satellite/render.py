@@ -174,10 +174,14 @@ def render_path_videos(
     out_size: Tuple[int, int] = (1280, 720),
     name: str = "custom",
     seed: int = 0,
+    keep_classes: Optional[set] = None,
     progress_cb: Optional[ProgressCb] = None,
     frame_cb: Optional[FrameCb] = None,
 ) -> Dict[str, Any]:
-    """Render a user-designed camera path (CameraKey list) as labeled videos: one per light × source."""
+    """Render a user-designed camera path (CameraKey list) as labeled videos: one per light × source.
+
+    ``keep_classes``: only these class ids are labeled (None = all).
+    """
     from desktop_app.satellite.synth import path_from_keyframes
 
     out = Path(out_dir)
@@ -196,6 +200,8 @@ def render_path_videos(
             from desktop_app.satellite.align import covered_classes
 
             keep = covered_classes(layout, mask)
+        if keep_classes is not None:
+            keep = set(keep_classes) if keep is None else (keep & set(keep_classes))
         real_night = src_name.startswith("night:")
         mode = "day" if (real_night or light == "day") else light
         view = make_night_mosaic(img, layout.meters_per_px, random.Random(seed + j), mode=mode) if mode != "day" else img

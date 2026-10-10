@@ -9,6 +9,7 @@ from shared.qt_compat import QDialog, QMessageBox, qt_exec
 from desktop_app.atlas import (
     RegionAtlas,
     finalize_base_model,
+    instant_subregion,
     prepare_atlas_data,
     prepare_subregion_project,
 )
@@ -136,6 +137,9 @@ class AtlasActionsMixin:
         r = dlg.result
         atlas: RegionAtlas = r["atlas"]
         weights = atlas.base_weights_path()
+        if r.get("mode") == "instant":
+            self._instant_subregion(r)
+            return
         self.log(f"Fine-tune sub-region '{r['project_name']}' from atlas '{atlas.name}'", "head")
 
         def job(progress, _frame):
@@ -156,3 +160,39 @@ class AtlasActionsMixin:
             self._start_pipeline(cfg)
 
         self._run_atlas_job("Preparing sub-region from atlas (cached tiles)…", job, on_ok)
+
+    def _instant_subregion(self, r: Dict[str, Any]) -> None:
+        """Sub-region without training: base model + new scene (+ Jetson package)."""
+        atlas: RegionAtlas = r["atlas"]
+        self.log(f"Instant sub-region '{r['project_name']}' from atlas '{atlas.name}' (no training)", "head")
+
+        def job(progress, _frame):
+            return instant_subregion(
+                atlas, r["target_lonlat"], r["project_dir"], project_name=r["project_name"],
+                zoom_out_factor=r["zoom_out_factor"], build_package=bool(r.get("build_package", True)),
+                progress_cb=progress, should_stop=lambda: self._atlas_stop,
+            )
+
+        def on_ok(res: Any) -> None:
+            if not self._open_project_path(Path(str(res["project"]))):
+                return
+            self.log(f"Model (atlas base): {res['weights']}", "ok")
+            lines = [
+                f"Sub-region '{r['project_name']}' is ready — no training was needed.",
+                "The target is located from the atlas landmarks the base model detects.",
+            ]
+            if res.get("package"):
+                self.log(f"Jetson package: {res['package']}", "ok")
+                lines.append(f"\nJetson package:\n{res['package']}")
+            elif res.get("package_error"):
+                self.log(f"Jetson package failed: {res['package_error']}", "warn")
+                lines.append(f"\nJetson package failed: {res['package_error']}")
+            lines.append(
+                "\nTry it with Test Model (Live Test). If the target is lost when the camera is very "
+                "close (no landmark in view), create the sub-region again in Fine-tune mode."
+            )
+            self.status_box.setText("\n".join(lines))
+            self.statusBar().showMessage("Instant sub-region ready")
+            QMessageBox.information(self, "Region Atlas", "\n".join(lines))
+
+        self._run_atlas_job("Creating instant sub-region (cached tiles, no training)…", job, on_ok)

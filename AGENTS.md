@@ -31,6 +31,7 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Auto pipeline logic | `desktop_app/pipeline/auto.py` |
 | Region atlas record / geo helpers | `desktop_app/atlas/model.py` |
 | Atlas build (chunks, global landmarks, videos) | `desktop_app/atlas/build.py` |
+| Atlas landmark tours (camera flight over every chunk landmark) | `desktop_app/atlas/tour.py` |
 | Atlas sub-region fine-tune | `desktop_app/atlas/finetune.py` |
 | Atlas UI actions / dialogs | `desktop_app/gui/atlas_actions.py`, `atlas_build_dialog.py`, `atlas_finetune_dialog.py` |
 | Jetson runtime | `jetson_runtime/runtime/pipeline.py` |

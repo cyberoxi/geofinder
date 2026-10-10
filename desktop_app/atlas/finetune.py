@@ -3,6 +3,9 @@
 The new scene keeps the atlas class list (target + every atlas landmark, projected from
 lon/lat), so the base model's whole network — head included — is reused and only the
 target class has to be learned. Imagery comes from the tile cache filled by the atlas build.
+
+Instant mode skips training altogether: the base model already detects the atlas landmarks,
+and the localizer projects the target from them through the new scene layout.
 """
 
 from __future__ import annotations
@@ -157,11 +160,15 @@ def prepare_subregion_project(
     night_fraction: float = 0.2,
     ir_fraction: float = 0.1,
     freeze: int = 10,
+    instant: bool = False,
     cache_dir: str | Path | None = None,
     progress_cb: Optional[ProgressCb] = None,
     should_stop: Optional[StopCb] = None,
 ) -> Path:
-    """New project with labeled videos of the target, linked to the atlas base model. Returns its folder."""
+    """New project with labeled videos of the target, linked to the atlas base model. Returns its folder.
+
+    ``instant``: also install the base weights as this project's model (no training needed).
+    """
     from desktop_app.project_manager.manager import ProjectManager
     from desktop_app.satellite.render import render_scene_videos
 
@@ -213,12 +220,77 @@ def prepare_subregion_project(
             "classes": atlas.classes,
             "freeze": int(freeze),
             "imgsz": atlas.imgsz,
+            "mode": "instant" if instant else "finetune",
         }
         pm.save_meta()
+        if instant:
+            _install_base_model(atlas, weights, pm.runs_dir)
     finally:
         pm.close()
     progress(100, 100, f"Sub-region ready: {len(prep['keep']) - 1} atlas landmarks in view")
     return root
+
+
+def _install_base_model(atlas: RegionAtlas, weights: Path, runs_dir: Path) -> Path:
+    """Base weights as ``runs/atlas_base/weights/best.pt`` — where Live Test and packaging look."""
+    import shutil
+
+    dest = runs_dir / "atlas_base" / "weights" / "best.pt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(weights, dest)
+    cfg = atlas.base_project_dir / "runs" / "training_config.yaml"  # imgsz for the ONNX export
+    if cfg.is_file():
+        shutil.copy2(cfg, runs_dir / "training_config.yaml")
+    return dest
+
+
+def instant_subregion(
+    atlas: RegionAtlas,
+    target_lonlat: Sequence[Sequence[float]],
+    project_dir: str | Path,
+    *,
+    project_name: str = "",
+    zoom_out_factor: float = 10.0,
+    build_package: bool = True,
+    cache_dir: str | Path | None = None,
+    progress_cb: Optional[ProgressCb] = None,
+    should_stop: Optional[StopCb] = None,
+) -> Dict[str, Any]:
+    """Sub-region without training: scene + one check video + base model (+ Jetson package).
+
+    Returns {"project": folder, "weights": best.pt, "package": zip or None, "package_error": str}.
+    """
+    from desktop_app.project_manager.manager import ProjectManager
+
+    progress = progress_cb or (lambda d, t, m: None)
+
+    def _prep(d: int, t: int, msg: str) -> None:
+        if t > 0:
+            progress(int(80 * d / t), 100, msg)
+
+    root = prepare_subregion_project(
+        atlas, target_lonlat, project_dir, project_name=project_name, n_videos=1,
+        zoom_out_factor=zoom_out_factor, night_fraction=0.0, ir_fraction=0.0, instant=True,
+        cache_dir=cache_dir, progress_cb=_prep, should_stop=should_stop,
+    )
+    out: Dict[str, Any] = {
+        "project": root, "weights": root / "runs" / "atlas_base" / "weights" / "best.pt",
+        "package": None, "package_error": "",
+    }
+    if build_package:
+        from desktop_app.packaging.builder import PackageBuilder
+
+        progress(85, 100, "Building Jetson package (base model + sub-region scene)…")
+        pm = ProjectManager.open(root)
+        try:
+            out["package"] = PackageBuilder(pm).build(weights_pt=out["weights"])
+        except Exception as exc:  # noqa: BLE001 — the project itself is ready
+            logger.warning("Instant sub-region: package failed: %s", exc)
+            out["package_error"] = str(exc)
+        finally:
+            pm.close()
+    progress(100, 100, "Instant sub-region ready (no training)")
+    return out
 
 
 def finetune_source(pm: Any) -> Optional[Tuple[str, int]]:

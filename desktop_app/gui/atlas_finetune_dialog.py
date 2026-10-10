@@ -1,4 +1,4 @@
-"""Dialog: pick a target inside a region atlas → new project fine-tuned from the atlas base model."""
+"""Dialog: pick a target inside a region atlas → new project (instant or fine-tuned from the base model)."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from desktop_app.satellite.map_widget import SatelliteMapPanel
 
 
 class AtlasFinetuneDialog(QDialog):
-    """``result`` = {"atlas", "target_lonlat", "project_dir", "project_name", "n_videos", "epochs", ...}."""
+    """``result`` = {"atlas", "mode", "target_lonlat", "project_dir", "project_name", "n_videos", "epochs", ...}."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,10 +47,13 @@ class AtlasFinetuneDialog(QDialog):
         side.setMinimumWidth(360)
         sv = QVBoxLayout(side)
         intro = QLabel(
-            "Choose an atlas, then draw the <b>target</b> inside its dashed orange boundary. "
-            "A new project is created and trained from the atlas base model — no new download, "
-            "no landmark search, few epochs.<br>"
-            "<span style='color:#aaa'>هدف را داخل محدوده نارنجی اطلس رسم کنید.</span>"
+            "Choose an atlas, then draw the <b>target</b> inside its dashed orange boundary.<br>"
+            "<b>Instant</b>: no training — the base model finds the atlas landmarks and the target is "
+            "placed from them (seconds).<br>"
+            "<b>Fine-tune</b>: also trains the target itself (better when the camera is so close that "
+            "no landmark is visible).<br>"
+            "<span style='color:#aaa'>هدف را داخل محدوده نارنجی اطلس رسم کنید. حالت فوری بدون آموزش است "
+            "و هدف از روی لندمارک‌های مدل پایه پیدا می‌شود.</span>"
         )
         intro.setWordWrap(True)
         sv.addWidget(intro)
@@ -70,6 +73,10 @@ class AtlasFinetuneDialog(QDialog):
         sv.addWidget(self.atlas_info)
 
         form = QFormLayout()
+        self.mode = QComboBox()
+        self.mode.addItem("Instant — no training (seconds) / فوری", "instant")
+        self.mode.addItem("Fine-tune — train the target (minutes) / ری‌فاین", "finetune")
+        form.addRow("Mode", self.mode)
         self.proj_name = QLineEdit("target_1")
         form.addRow("Project name", self.proj_name)
         folder_row = QHBoxLayout()
@@ -101,19 +108,31 @@ class AtlasFinetuneDialog(QDialog):
         self.night = QCheckBox("Night / thermal variants")
         self.night.setChecked(True)
         form.addRow("", self.night)
+        self.package = QCheckBox("Build Jetson package")
+        self.package.setChecked(True)
+        form.addRow("", self.package)
         sv.addLayout(form)
         sv.addStretch(1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Create && fine-tune")
+        self._ok = buttons.button(QDialogButtonBox.Ok)
         buttons.accepted.connect(self._try_accept)
         buttons.rejected.connect(self.reject)
         sv.addWidget(buttons)
         root.addWidget(side, stretch=1)
 
+        self.mode.currentIndexChanged.connect(lambda _i: self._mode_changed())
+        self._mode_changed()
         self.atlas_combo.currentIndexChanged.connect(lambda _i: self._load_atlas(self.atlas_combo.currentData()))
         if self.atlas_combo.count():
             self._load_atlas(self.atlas_combo.currentData())
+
+    def _mode_changed(self) -> None:
+        instant = self.mode.currentData() == "instant"
+        for w in (self.n_videos, self.epochs, self.freeze, self.night):
+            w.setEnabled(not instant)
+        self.package.setEnabled(instant)  # fine-tune: the training pipeline builds the package
+        self._ok.setText("Create (instant)" if instant else "Create && fine-tune")
 
     # ------------------------------------------------------------ atlas
     def _browse_atlas(self) -> None:
@@ -181,6 +200,8 @@ class AtlasFinetuneDialog(QDialog):
         night = self.night.isChecked()
         self.result = {
             "atlas": self.atlas,
+            "mode": self.mode.currentData(),
+            "build_package": self.package.isChecked(),
             "target_lonlat": [[float(lon), float(lat)] for lon, lat in poly],
             "project_dir": project_dir,
             "project_name": name,

@@ -126,6 +126,14 @@ class AtlasBuildDialog(QDialog):
         self.videos.setRange(1, 16)
         self.videos.setValue(4)
         form.addRow("Videos / chunk", self.videos)
+        self.tours = QSpinBox()
+        self.tours.setRange(0, 8)
+        self.tours.setValue(2)
+        self.tours.setToolTip(
+            "Camera flights over EVERY landmark of a chunk (close + high passes, day / night).\n"
+            "Without them, landmarks far from the zoom centres are never learned."
+        )
+        form.addRow("Landmark tours / chunk", self.tours)
         self.night = QCheckBox("Night / thermal variants")
         self.night.setChecked(True)
         form.addRow("", self.night)
@@ -143,7 +151,8 @@ class AtlasBuildDialog(QDialog):
         form.addRow("Model type", self.model_type)
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 500)
-        self.epochs.setValue(60)
+        self.epochs.setValue(100)
+        self.epochs.setToolTip("The base model does the main training once; sub-regions then fine-tune briefly.")
         form.addRow("Base epochs", self.epochs)
         sv.addLayout(form)
 
@@ -168,7 +177,7 @@ class AtlasBuildDialog(QDialog):
         self._est_timer.setSingleShot(True)
         self._est_timer.timeout.connect(self._update_estimate)
         self.map_panel.map.selection_changed.connect(lambda: self._est_timer.start(250))
-        for sb in (self.zoom, self.videos):
+        for sb in (self.zoom, self.videos, self.tours):
             sb.valueChanged.connect(lambda _v: self._est_timer.start(250))
         restore_map_view(self.map_panel)
 
@@ -179,6 +188,7 @@ class AtlasBuildDialog(QDialog):
             landmarks_per_chunk=self.lm_per_chunk.value(),
             max_landmarks=self.max_lm.value(),
             videos_per_chunk=self.videos.value(),
+            tour_videos=self.tours.value(),
             use_sam=self.use_sam.isChecked(),
             night_fraction=0.2 if night else 0.0,
             ir_fraction=0.1 if night else 0.0,
@@ -216,7 +226,7 @@ class AtlasBuildDialog(QDialog):
         self.name.setText(atlas.name)
         self.zoom.setValue(atlas.zoom)
         self.model_type.setCurrentText(atlas.model_type)
-        for w in (self.name, self.zoom, self.layer, self.lm_per_chunk, self.max_lm, self.videos,
+        for w in (self.name, self.zoom, self.layer, self.lm_per_chunk, self.max_lm, self.videos, self.tours,
                   self.night, self.use_sam, self.model_type):
             w.setEnabled(False)
         s, w_, n, e = atlas.swne

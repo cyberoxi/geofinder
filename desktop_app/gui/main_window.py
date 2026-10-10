@@ -376,8 +376,8 @@ class DesktopMainWindow(
         )
         atlas_menu.addAction(
             self._tb_action(
-                "Fine-tune Sub-region from Atlas…", "train", self.finetune_from_atlas,
-                tip="Pick a target inside an atlas — fast fine-tune from the base model",
+                "Sub-region from Atlas (instant / fine-tune)…", "train", self.finetune_from_atlas,
+                tip="Pick a target inside an atlas — instant (no training) or fast fine-tune from the base model",
             )
         )
         self._build_offline_menu()
@@ -565,7 +565,7 @@ class DesktopMainWindow(
         actions_layout.setSpacing(6)
         for text, icon_name, slot, key in [
             ("Region Atlas: Build Base Model", "satellite", self.build_region_atlas, None),
-            ("Region Atlas: Fine-tune Sub-region", "train", self.finetune_from_atlas, None),
+            ("Region Atlas: Sub-region (instant / fine-tune)", "train", self.finetune_from_atlas, None),
             ("Edit Landmarks", "landmarks", self.edit_landmarks, None),
             ("Camera Path", "path", self.design_camera_path, None),
             ("Build Test Videos", "test", self.build_test_videos, None),

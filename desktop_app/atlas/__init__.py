@@ -2,7 +2,7 @@
 
 - model.py — RegionAtlas record (atlas.json) + lon/lat ↔ mosaic pixel helpers
 - build.py — chunk planning, global landmarks, chunk videos, base project
-- finetune.py — sub-region scene/project linked to the atlas base model
+- finetune.py — sub-region scene/project linked to the atlas base model (fine-tune or instant)
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from desktop_app.atlas.build import (
 )
 from desktop_app.atlas.finetune import (
     finetune_source,
+    instant_subregion,
     prepare_subregion_project,
     prepare_subregion_scene,
     validate_target,
@@ -30,6 +31,7 @@ __all__ = [
     "estimate",
     "finalize_base_model",
     "finetune_source",
+    "instant_subregion",
     "new_atlas",
     "plan_chunks",
     "prepare_atlas_data",

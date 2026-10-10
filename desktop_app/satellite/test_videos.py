@@ -36,29 +36,101 @@ def _exclusion_radius(t_size: float, view_h: float, aspect: float = 16 / 9) -> f
     return half_diag + 0.5 * t_size + 0.15 * view_h
 
 
-def _sample_empty_center(
+def _max_safe_view_h(dist: float, t_size: float, aspect: float = 16 / 9) -> float:
+    """Largest view height that keeps the target out of frame at this centre distance."""
+    denom = 0.5 * math.hypot(aspect, 1.0) + 0.25  # pad for start_offset / end_jitter drift
+    return max(16.0, (dist - 0.5 * t_size) / denom)
+
+
+def _sample_far_empty_center(
     cam: MosaicCamera,
     t_center: Tuple[float, float],
     t_size: float,
-    view_h: float,
+    min_view_h: float,
     rng: random.Random,
     *,
-    attempts: int = 80,
-) -> Optional[Tuple[float, float]]:
-    """Random mosaic centre whose mid-altitude view never covers the target."""
-    excl = _exclusion_radius(t_size, view_h, cam.aspect)
-    margin = view_h * 0.55
+    attempts: int = 160,
+) -> Optional[Tuple[Tuple[float, float], float]]:
+    """
+    Pick a mosaic centre far from the target (prefer borders / corners).
+
+    Returns ``(center, max_safe_view_h)`` so callers can cap zoom/pan altitude
+    and still keep the project target out of frame.
+    """
+    # Keep the frame inside the mosaic; use a modest margin so far corners stay reachable.
+    margin = min(min_view_h * 0.35, 0.18 * min(cam.W, cam.H))
     lo_x, hi_x = margin, cam.W - margin
     lo_y, hi_y = margin, cam.H - margin
     if hi_x <= lo_x or hi_y <= lo_y:
         return None
     tx, ty = t_center
-    for _ in range(attempts):
-        cx = rng.uniform(lo_x, hi_x)
-        cy = rng.uniform(lo_y, hi_y)
-        if math.hypot(cx - tx, cy - ty) >= excl:
-            return (cx, cy)
-    return None
+    min_excl = _exclusion_radius(t_size, min_view_h, cam.aspect)
+    best: Optional[Tuple[Tuple[float, float], float]] = None
+    best_d = -1.0
+
+    def _consider(cx: float, cy: float) -> Optional[Tuple[Tuple[float, float], float]]:
+        nonlocal best, best_d
+        cx = min(max(cx, lo_x), hi_x)
+        cy = min(max(cy, lo_y), hi_y)
+        d = math.hypot(cx - tx, cy - ty)
+        if d < min_excl:
+            return None
+        safe = _max_safe_view_h(d, t_size, cam.aspect)
+        if safe < min_view_h:
+            return None
+        if d > best_d:
+            best = ((cx, cy), safe)
+            best_d = d
+        # Accept immediately when clearly in the far periphery
+        if d >= min_excl * 1.35:
+            return ((cx, cy), safe)
+        return None
+
+    # 1) Ray from target toward random headings — place as far as the mosaic allows
+    for _ in range(attempts // 2):
+        ang = rng.uniform(0.0, 2.0 * math.pi)
+        dx, dy = math.cos(ang), math.sin(ang)
+        # Distance to each usable edge along this ray
+        ts: List[float] = []
+        if abs(dx) > 1e-9:
+            ts.append((lo_x - tx) / dx)
+            ts.append((hi_x - tx) / dx)
+        if abs(dy) > 1e-9:
+            ts.append((lo_y - ty) / dy)
+            ts.append((hi_y - ty) / dy)
+        ts = [t for t in ts if t > 0]
+        if not ts:
+            continue
+        # Pull slightly inward from the hard edge
+        reach = max(ts) * rng.uniform(0.82, 0.98)
+        hit = _consider(tx + dx * reach, ty + dy * reach)
+        if hit is not None:
+            return hit
+
+    # 2) Border-band samples (corners / edges)
+    span_x = max(1e-6, hi_x - lo_x)
+    span_y = max(1e-6, hi_y - lo_y)
+    band = 0.22
+    for _ in range(attempts // 2):
+        side = rng.choice(("top", "bottom", "left", "right", "corner"))
+        if side == "top":
+            cx, cy = rng.uniform(lo_x, hi_x), lo_y + rng.uniform(0, band) * span_y
+        elif side == "bottom":
+            cx, cy = rng.uniform(lo_x, hi_x), hi_y - rng.uniform(0, band) * span_y
+        elif side == "left":
+            cx, cy = lo_x + rng.uniform(0, band) * span_x, rng.uniform(lo_y, hi_y)
+        elif side == "right":
+            cx, cy = hi_x - rng.uniform(0, band) * span_x, rng.uniform(lo_y, hi_y)
+        else:
+            cx = lo_x if rng.random() < 0.5 else hi_x
+            cy = lo_y if rng.random() < 0.5 else hi_y
+            cx += rng.uniform(-0.05, 0.05) * span_x
+            cy += rng.uniform(-0.05, 0.05) * span_y
+        hit = _consider(cx, cy)
+        if hit is not None:
+            return hit
+
+    return best
 
 
 def plan_test_variants(
@@ -192,9 +264,10 @@ def render_test_videos(
     *with-target* paths fly over the selected target; *without-target* paths use
     either random hard-negative centres or user-drawn map regions.
 
-    ``empty_region_mode``: ``"random"`` samples centres that keep the target out of
-    frame; ``"manual"`` cycles through ``empty_regions`` (any user-drawn bboxes on
-    the mosaic — not rejected if the target is also visible).
+    ``empty_region_mode``: ``"random"`` samples centres on the far periphery of the
+    mosaic (borders/corners) and caps zoom/pan so the target stays out of frame;
+    ``"manual"`` cycles through ``empty_regions`` (any user-drawn bboxes on the
+    mosaic — not rejected if the target is also visible).
 
     ``zoom_start`` / ``zoom_end``: view height as multiples of the region size
     (larger = more zoomed out).  ``zoom_speed`` / ``pan_speed`` scale motion time
@@ -240,6 +313,8 @@ def render_test_videos(
         cam = cams[light]
 
         manual_pick = False
+        # For random hard-negatives, cap altitude so a far centre can keep the target out.
+        use_z_start, use_z_end, use_p_view = z_start, z_end, p_view
         if plan["has_target"]:
             center, size = t_center, t_size
         elif empty_region_mode == "manual" and manual:
@@ -247,13 +322,21 @@ def render_test_videos(
             empty_i += 1
             manual_pick = True
         else:
-            probe_vh = max(t_size * 3.5, 80.0)
-            empty = _sample_empty_center(cam, t_center, t_size, probe_vh, rng)
-            if empty is None:
+            size = max(t_size * 0.8, 64.0)
+            # Minimum view that still looks like a flyover (end zoom / tight pan).
+            min_vh = max(size * min(z_end, p_view, 2.5), 48.0)
+            picked = _sample_far_empty_center(cam, t_center, t_size, min_vh, rng)
+            if picked is None:
                 skipped += 1
                 continue
-            center = empty
-            size = max(t_size * 0.8, probe_vh / 4.0)
+            center, safe_vh = picked
+            # Cap start altitude to what this far region can hide; keep a zoom-in range.
+            max_factor = safe_vh / size
+            use_z_start = min(z_start, max_factor)
+            use_z_end = min(z_end, max(0.5, use_z_start * 0.55))
+            if use_z_end >= use_z_start:
+                use_z_end = max(0.5, use_z_start * 0.55)
+            use_p_view = min(p_view, max_factor)
 
         if plan["kind"] == "zoom":
             poses = zoom_path(
@@ -264,8 +347,8 @@ def render_test_videos(
                 rng,
                 angle=plan["angle"],
                 angle_drift=plan.get("drift", 0.0),
-                start_view_factor=z_start,
-                end_view_factor=z_end,
+                start_view_factor=use_z_start,
+                end_view_factor=use_z_end,
                 start_offset=plan.get("start_off", 0.0),
                 end_jitter=plan.get("jitter", 0.0),
             )
@@ -277,7 +360,7 @@ def render_test_videos(
                 n_pan,
                 rng,
                 angle=plan["angle"],
-                view_factor=p_view,
+                view_factor=use_p_view,
                 length_factor=plan.get("length", 3.0),
             )
 

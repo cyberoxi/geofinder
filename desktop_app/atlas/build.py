@@ -24,6 +24,7 @@ from desktop_app.atlas.model import (
     mosaic_to_lonlat,
     point_in_ring,
 )
+from desktop_app.atlas.tour import tour_keys, tour_lights
 from desktop_app.satellite.scene import draw_scene_preview, meters_per_pixel
 from desktop_app.satellite.tiles import TILE_SIZE, count_tiles, fetch_mosaic
 from shared.landmarks import SceneLayout
@@ -42,6 +43,7 @@ class AtlasBuildOptions:
     max_landmarks: int = 120
     videos_per_chunk: int = 4
     focus_per_chunk: int = 2
+    tour_videos: int = 2  # flights over EVERY landmark of the chunk (see tour.py)
     max_tiles_per_chunk: int = 300
     overlap: float = 0.15
     use_sam: bool = True
@@ -126,7 +128,7 @@ def estimate(
         "tiles": tiles,
         "download_mb": round(tiles * 0.025, 1),
         "area_km2": round(km_ns * km_ew, 2),
-        "videos": len(chunks) * opts.videos_per_chunk,
+        "videos": len(chunks) * (opts.videos_per_chunk + opts.tour_videos),
         "meters_per_px": round(meters_per_pixel((s + n) / 2.0, zoom), 2),
     }
 
@@ -317,7 +319,7 @@ def scan_landmarks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb,
 
 def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, should_stop: StopCb) -> None:
     """Stage 2: labeled videos per chunk (all atlas landmarks; no target labels)."""
-    from desktop_app.satellite.render import render_scene_videos
+    from desktop_app.satellite.render import render_path_videos, render_scene_videos
 
     opts = AtlasBuildOptions.from_dict(atlas.settings.get("build", {}))
     n = len(atlas.chunks)
@@ -351,6 +353,16 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
             fi = (len(focuses) - 1 - k) % len(focuses)
             lights[fi][0 if k < n_night else 1] += 1
         videos: List[Dict[str, str]] = []
+        tours = tour_lights(opts.tour_videos, opts.night_fraction, opts.ir_fraction)
+        n_steps = len(focuses) + len(tours)
+
+        def _add(res: Dict[str, Any]) -> None:
+            for v in res.get("videos") or []:
+                videos.append({
+                    "path": str(Path(v["path"]).relative_to(atlas.root)),
+                    "labels": str(Path(v["labels"]).relative_to(atlas.root)),
+                })
+
         for fi, (focus, nv) in enumerate(zip(focuses, per)):
             if nv <= 0:
                 continue
@@ -359,7 +371,7 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
 
             def _p(d: int, t: int, msg: str, idx: int = idx, fi: int = fi) -> None:
                 if t > 0:
-                    frac = (fi + d / t) / len(focuses)
+                    frac = (fi + d / t) / n_steps
                     progress_cb(40 + int(55 * (idx + frac) / n), 100, f"Chunk {idx + 1}/{n} videos: {msg}")
 
             res = render_scene_videos(
@@ -368,14 +380,28 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
                 duration_s=opts.duration_s, fps=opts.fps, seed=int(chunk["id"]) * 17 + fi,
                 keep_classes=keep, progress_cb=_p,
             )
-            for v in res.get("videos") or []:
-                videos.append({
-                    "path": str(Path(v["path"]).relative_to(atlas.root)),
-                    "labels": str(Path(v["labels"]).relative_to(atlas.root)),
-                })
+            _add(res)
             if fi == 0:
                 layout.save(atlas.chunk_dir(chunk["id"]) / "scene.json")
                 cv2.imwrite(str(atlas.chunk_dir(chunk["id"]) / "scene_preview.jpg"), draw_scene_preview(mosaic, layout))
+        # Landmark tours: every landmark of the chunk seen up close (day + night / IR)
+        layout, keep = chunk_layout(atlas, chunk, mosaic, (W / 2.0, H / 2.0), focus_size)
+        for ti, light in enumerate(tours):
+            if should_stop():
+                raise RuntimeError("Stopped by user")
+            keys = tour_keys(atlas, chunk, keep, (W, H), ti, random.Random(5000 + int(chunk["id"]) * 31 + ti))
+            if not keys:
+                break
+
+            def _pt(d: int, t: int, msg: str, idx: int = idx, ti: int = ti) -> None:
+                if t > 0:
+                    frac = (len(focuses) + ti + d / t) / n_steps
+                    progress_cb(40 + int(55 * (idx + frac) / n), 100, f"Chunk {idx + 1}/{n} landmark tour: {msg}")
+
+            _add(render_path_videos(
+                mosaic, layout, keys, atlas.chunk_dir(chunk["id"]) / "tours", lights=(light,), fps=opts.fps,
+                name=f"tour{ti}", seed=int(chunk["id"]) * 31 + ti, keep_classes=keep, progress_cb=_pt,
+            ))
         chunk["videos"] = videos
         chunk["status"] = "rendered"
         atlas.save()
