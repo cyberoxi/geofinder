@@ -136,6 +136,7 @@ class InputSourceDialog(QDialog):
         if is_csi and self.width.value() < 640:
             self.width.setValue(1920)
             self.height.setValue(1080)
+            self.fps.setValue(60)
         if is_usb and self.width.value() > 1920 and self._initial.kind != KIND_USB:
             self.width.setValue(1280)
             self.height.setValue(720)

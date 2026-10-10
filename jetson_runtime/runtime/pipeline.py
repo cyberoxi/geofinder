@@ -36,26 +36,69 @@ class RTSPVideoSource:
         raise NotImplementedError("RTSP source is reserved for a future release. Use file video for now.")
 
 
-def _pick_model_path(engine, onnx, pt) -> tuple[str, list[str]]:
-    """Prefer TensorRT, then GPU ONNX, else PyTorch (CUDA) over CPU-only ONNX."""
-    if engine is not None:
-        primary = engine
-    elif onnx is not None and pt is not None:
-        try:
-            import onnxruntime as ort
+_CUDA_OK: Optional[bool] = None
 
-            providers = ort.get_available_providers()
-            gpu_ort = any(p in providers for p in ("CUDAExecutionProvider", "TensorrtExecutionProvider"))
-        except Exception:  # noqa: BLE001
-            gpu_ort = False
-        # CPU ORT is much slower than .pt on Orin CUDA; Live Test on desktop uses .pt.
-        primary = onnx if gpu_ort else pt
+
+def _cuda_usable() -> bool:
+    """True only if a real CUDA alloc works (Jetson often reports available then NvRm fails)."""
+    global _CUDA_OK
+    if _CUDA_OK is not None:
+        return _CUDA_OK
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            _CUDA_OK = False
+            return False
+        torch.zeros(1, device="cuda")
+        _CUDA_OK = True
+    except Exception:  # noqa: BLE001
+        _CUDA_OK = False
+    return bool(_CUDA_OK)
+
+
+def _pick_model_path(engine, onnx, pt) -> tuple[str, list[str]]:
+    """Prefer TensorRT / CUDA PyTorch when GPU works; on CPU prefer ONNX over .pt."""
+    cuda = _cuda_usable()
+    if cuda:
+        if engine is not None:
+            primary = engine
+        elif pt is not None:
+            # .pt on Orin CUDA beats CPU ONNX; GPU ORT is optional.
+            primary = pt
+        else:
+            primary = onnx
     else:
+        # Engine / CUDA .pt cannot run; ONNX via ORT-CPU is the least-bad fallback.
+        if engine is not None:
+            logger.warning("CUDA unavailable — skipping TensorRT engine (use ONNX/CPU)")
         primary = onnx or pt
+        if primary is not None:
+            logger.warning(
+                "CUDA unavailable (nvidia-smi / NvRmGpuLibOpen) — running on CPU. "
+                "Reboot the Jetson for normal FPS; CPU is often only a few FPS."
+            )
     if primary is None:
         return "", []
     fallbacks = [str(p) for p in (engine, onnx, pt) if p is not None and p != primary]
     return str(primary), fallbacks
+
+
+def _apply_cpu_speed_defaults(loader: PackageLoader, yolo: YOLODetector) -> None:
+    """When stuck on CPU, detect less often and shrink .pt imgsz so optical flow can carry FPS."""
+    if yolo.device != "cpu":
+        return
+    tcfg = loader.runtime_config.setdefault("tracking", {})
+    # ~220ms/infer on Orin CPU → need sparse YOLO + frame skip for usable wall FPS.
+    every = max(int(tcfg.get("detect_every_n", 2)), 6)
+    tcfg["detect_every_n"] = every
+    tcfg["target_fps"] = max(float(tcfg.get("target_fps", 20.0)), 15.0)
+    tcfg["adaptive_skip"] = True
+    if yolo.backend == "pytorch" and yolo.imgsz > 320:
+        # Static ONNX/engine inputs must stay at export size; .pt can letterbox smaller.
+        logger.info("CPU PyTorch: imgsz %d → 320 for speed", yolo.imgsz)
+        yolo.imgsz = 320
+    logger.info("CPU speed mode: detect_every_n=%d imgsz=%d (reboot for GPU/CUDA)", every, yolo.imgsz)
 
 
 def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]:
@@ -78,10 +121,14 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         else:
             localizer = TargetLocalizer(layout)
             logger.info("Landmark localizer enabled (%d landmarks)", layout.num_landmarks)
-    return YOLODetector(
+    # If CUDA is down, force cpu so Ultralytics does not keep retrying a dead GPU.
+    device = ycfg.get("device", "cuda")
+    if str(device).lower() in ("cuda", "0", "gpu", "tensorrt") and not _cuda_usable():
+        device = "cpu"
+    yolo = YOLODetector(
         model_path=model_path,
         mode=ycfg.get("mode", loader.manifest.model_type if loader.manifest else "segmentation"),
-        device=ycfg.get("device", "cuda"),
+        device=device,
         imgsz=int(ycfg.get("imgsz", loader.manifest.input_size if loader.manifest else 640)),
         confidence_threshold=float(loader.manifest.min_confidence if loader.manifest else 0.45),
         # NMS IoU — same as the desktop Live Test (Ultralytics default). manifest.min_iou is a
@@ -94,11 +141,17 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         localizer=localizer,
         stabilizer_cfg=loader.runtime_config.get("stabilizer"),
     )
+    if yolo.available:
+        _apply_cpu_speed_defaults(loader, yolo)
+    return yolo
 
 
-def _draw_footer(img: np.ndarray, result) -> None:
+def _draw_footer(img: np.ndarray, result, avg_fps: float = 0.0) -> None:
     """Runtime stats under the desktop-style overlay (bottom-left)."""
-    text = f"frame {result.frame_id}  {result.process_fps:.1f} fps  infer {result.inference_ms:.0f} ms"
+    text = (
+        f"frame {result.frame_id}  {avg_fps:.1f} fps  "
+        f"infer {result.inference_ms:.0f} ms"
+    )
     put_outlined(img, text, (12, img.shape[0] - 14), (230, 230, 230), 0.6, 2)
 
 
@@ -130,12 +183,28 @@ def run_runtime(
     source: Optional[Any] = None,
     min_conf: Optional[float] = None,
     min_conf_cb: Optional[Callable[[], Optional[float]]] = None,
+    stabilizer_override: Optional[Dict[str, Any]] = None,
+    stabilizer_cb: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """``min_conf`` overrides the package's min confidence; ``min_conf_cb`` is polled every frame
-    so a GUI slider can change it while running (both 0–1)."""
+    so a GUI slider can change it while running (both 0–1).
+
+    ``stabilizer_override`` / ``stabilizer_cb`` mirror the desktop Live Test filter toggles
+    (geometry / temporal / aux-consistency).
+    """
     setup_logging()
     loader = PackageLoader(package_path)
     root = loader.load()
+    if stabilizer_override:
+        from shared.target_stabilizer import merge_stabilizer_config
+
+        loader.runtime_config["stabilizer"] = merge_stabilizer_config(stabilizer_override)
+        logger.info(
+            "Stabilizer override: geometry=%s temporal=%s aux=%s",
+            loader.runtime_config["stabilizer"].get("geometry_check"),
+            loader.runtime_config["stabilizer"].get("temporal"),
+            loader.runtime_config["stabilizer"].get("landmark_consistency"),
+        )
     yolo = build_detector_from_package(loader)
     if yolo is not None and min_conf is not None:
         yolo.set_confidence(min_conf)
@@ -164,7 +233,9 @@ def run_runtime(
         )
 
     spec = _resolve_source_spec(video_path, prefer_gstreamer, source)
-    frame_source: FrameSource = open_input_source(spec)
+    # Do not hard-fail on soft/blank AE frames — Camera Test / Import Source already
+    # preview the same feed; keep Run usable and log a warning instead.
+    frame_source: FrameSource = open_input_source(spec, require_scene=False)
     assert frame_source.info is not None
     source_label = frame_source.label
     logger.info("Input source: %s (live=%s)", source_label, frame_source.is_live)
@@ -194,6 +265,11 @@ def run_runtime(
         serial.close()
         frame_source.release()
         raise RuntimeError(f"Cannot read frames from {source_label}")
+    if frame_source.is_live:
+        from shared.video_reader import frame_lacks_scene, imx477_blank_frame_hint
+
+        if frame_lacks_scene(frame):
+            logger.warning("%s", imx477_blank_frame_hint())
 
     if isinstance(tracker, DetectionTracker):
         # No guessed start ROI: the detector + stabilizer decide from frame 0
@@ -229,7 +305,9 @@ def run_runtime(
     t0 = time.perf_counter()
     idx = 0
     last_ui = 0.0
-    ui_interval = 1.0 / 18.0  # match GUI preview cap; skip overlay work between refreshes
+    # Lower preview rate on CPU so Qt resize/paint does not eat detect time
+    ui_hz = 10.0 if (yolo is not None and yolo.device == "cpu") else 18.0
+    ui_interval = 1.0 / ui_hz
     if end_frame >= 0:
         last = end_frame
     elif frame_source.is_live or frame_source.info.frame_count <= 0:
@@ -250,13 +328,37 @@ def run_runtime(
                 if want is not None and abs(want - yolo.confidence_threshold) > 1e-6:
                     yolo.set_confidence(want)
                     logger.info("Min confidence → %.0f%%", yolo.confidence_threshold * 100)
+            if stabilizer_cb is not None:
+                want_stab = stabilizer_cb()
+                if want_stab is not None and hasattr(tracker, "set_stabilizer"):
+                    # Cheap change detect: compare the three master switches + key ints.
+                    cur = getattr(tracker, "stabilizer", None)
+                    cur_cfg = cur.cfg if cur is not None else {}
+                    keys = (
+                        "geometry_check",
+                        "temporal",
+                        "landmark_consistency",
+                        "confirm_hits",
+                        "confirm_window",
+                        "min_landmarks_acquire",
+                    )
+                    if any(want_stab.get(k) != cur_cfg.get(k) for k in keys):
+                        tracker.set_stabilizer(want_stab)
+                        logger.info(
+                            "Filters → geometry=%s temporal=%s aux=%s",
+                            want_stab.get("geometry_check"),
+                            want_stab.get("temporal"),
+                            want_stab.get("landmark_consistency"),
+                        )
             t_frame = time.perf_counter()
             state = tracker.update(frame, frame_idx=idx)
             dt = time.perf_counter() - t_frame
             fps = 1.0 / dt if dt > 0 else 0.0
             fps_list.append(fps)
+            # Wall-clock average (instant 1/infer looks like ~4 FPS on CPU detect frames).
+            wall_fps = (processed + 1) / max(time.perf_counter() - t0, 1e-6)
             result = tracker.to_frame_result(
-                idx, frame_source.reader.timestamp_of(idx), process_fps=fps
+                idx, frame_source.reader.timestamp_of(idx), process_fps=wall_fps
             )
             exporter.add_result(result)
 
@@ -290,7 +392,7 @@ def run_runtime(
                     # Same overlay as the desktop Live Test: target / aux objects / rejected /
                     # confirming, centre cross, arrow to the target, centre distance
                     annotated = draw_localization(frame, tracker.dets, tracker.loc, yolo.class_names)
-                    _draw_footer(annotated, result)
+                    _draw_footer(annotated, result, avg_fps=wall_fps)
                 else:
                     annotated = draw_overlay(frame, result, trail=state.trail)
                 if save_video:
@@ -298,7 +400,13 @@ def run_runtime(
                 if want_ui:
                     last_ui = now
                     frame_cb(annotated, info)
-            if state.status == RuntimeState.LOST and export_cfg.get("save_failed_frames", True):
+            # JPEG dumps on LOST are a large I/O tax; skip for live/GUI (same as video export).
+            if (
+                state.status == RuntimeState.LOST
+                and export_cfg.get("save_failed_frames", True)
+                and not frame_source.is_live
+                and frame_cb is None
+            ):
                 exporter.save_failed_frame(frame, idx)
             processed += 1
             if progress_cb:

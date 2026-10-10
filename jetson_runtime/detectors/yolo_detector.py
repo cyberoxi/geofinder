@@ -21,6 +21,11 @@ logger = get_logger("grt.yolo")
 # can replace onnxruntime with onnxruntime-gpu built for another CUDA, after which every
 # inference fails and nothing is detected. Missing packages must be installed by setup instead.
 os.environ.setdefault("YOLO_AUTOINSTALL", "False")
+# When CUDA is down, ORT/PyTorch CPU needs threads; leave a couple of cores for the GUI.
+_cpu = max(1, (os.cpu_count() or 4) - 2)
+os.environ.setdefault("OMP_NUM_THREADS", str(_cpu))
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+os.environ.setdefault("ORT_NUM_THREADS", str(_cpu))
 
 
 class _DropHalfDeprecation(logging.Filter):
@@ -111,6 +116,11 @@ class YOLODetector:
         if self.localizer is not None:
             self.localizer.min_confidence = self.confidence_threshold
 
+    def set_stabilizer(self, cfg: Optional[Dict[str, Any]]) -> None:
+        """Update geometry / aux filters live (Jetson GUI toggles)."""
+        self.stabilizer_cfg = merge_stabilizer_config(cfg)
+        self.predict_conf = detector_conf(self.confidence_threshold, self.stabilizer_cfg)
+
     def _resolve_path(self) -> Optional[Path]:
         candidates = [self._model_path, *self._fallback_paths]
         for c in candidates:
@@ -126,15 +136,40 @@ class YOLODetector:
         if pref == "cpu":
             return "cpu"
         if path.suffix.lower() == ".engine" or pref == "tensorrt":
-            return "0"  # Ultralytics uses CUDA device for TRT engines
-        # Probe CUDA
+            # Engine needs a working GPU; probe before claiming device 0.
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.zeros(1, device="cuda")
+                    return "0"
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "CUDA not usable for TensorRT (%s) — falling back to CPU (very slow).",
+                    exc,
+                )
+                return "cpu"
+            logger.error("CUDA not available for TensorRT — falling back to CPU (very slow).")
+            return "cpu"
+        # Probe CUDA (Jetson: is_available can be true while NvRmGpuLibOpen still fails)
         try:
             import torch
 
             if torch.cuda.is_available() and pref in ("cuda", "tensorrt", "0", "gpu"):
+                torch.zeros(1, device="cuda")
                 return "0"
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "CUDA not available — falling back to CPU (very slow, often <2 FPS). "
+                "Check GPU driver (nvidia-smi) and reboot if NvRmGpuLibOpen failed. (%s)",
+                exc,
+            )
+            return "cpu"
+        if pref in ("cuda", "tensorrt", "0", "gpu"):
+            logger.error(
+                "CUDA not available — falling back to CPU (very slow, often <2 FPS). "
+                "Check GPU driver (nvidia-smi) and reboot if NvRmGpuLibOpen failed."
+            )
         return "cpu"
 
     def _load_model(self) -> None:
@@ -174,6 +209,9 @@ class YOLODetector:
             self._half = self.use_fp16 and self.device != "cpu" and self.backend == "pytorch"
             self.available = True
             self.load_ms = (time.perf_counter() - t0) * 1000.0
+            if self.device == "cpu":
+                # One smoke infer is enough on CPU; 5× warmup wastes seconds and heats the board.
+                self.warmup_iterations = min(self.warmup_iterations, 1)
             logger.info(
                 "Loaded YOLO model %s backend=%s device=%s load=%.1fms",
                 path,
@@ -211,6 +249,8 @@ class YOLODetector:
                     device=self.device,
                     half=self._half,
                     verbose=False,
+                    max_det=50,
+                    retina_masks=False,
                 )
             except Exception as exc:  # noqa: BLE001
                 if i == 0:
@@ -238,6 +278,8 @@ class YOLODetector:
                 device=self.device,
                 half=self._half,
                 verbose=False,
+                max_det=50,
+                retina_masks=False,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error("YOLO inference failed: %s", exc)

@@ -55,7 +55,8 @@ DEFAULT_RUNTIME = {
         "min_iou": 0.20,
         "adaptive_skip": True,
         "target_fps": 20.0,
-        # Jetson DetectionTracker: run YOLO every N frames; optical flow bridges the rest
+        # Jetson DetectionTracker: run YOLO every N frames; optical flow bridges the rest.
+        # Pipeline raises this automatically when stuck on CPU.
         "detect_every_n": 2,
     },
     "yolo": {

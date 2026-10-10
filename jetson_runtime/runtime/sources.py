@@ -18,6 +18,8 @@ VALID_KINDS = (KIND_FILE, KIND_IMX477, KIND_USB)
 
 def describe_csi_hardware() -> str:
     """Short CSI/Argus status for the input dialog and open errors."""
+    from shared.video_reader import jetson_argus_available, jetson_gpu_power_hint
+
     videos = sorted(p.name for p in Path("/dev").glob("video*"))
     sensors: list[str] = []
     root = Path("/proc/device-tree")
@@ -25,6 +27,8 @@ def describe_csi_hardware() -> str:
         for tag in ("imx219", "imx477", "imx708", "ov5693"):
             sensors.extend(p.name for p in root.rglob(f"*{tag}*"))
     sensors = list(dict.fromkeys(sensors))
+    if not jetson_argus_available():
+        return jetson_gpu_power_hint()
     if sensors and videos:
         shown = ", ".join(sensors[:4])
         nodes = ", ".join(f"/dev/{n}" for n in videos[:4])
@@ -90,7 +94,8 @@ class InputSourceSpec:
             usb_index=int(data.get("usb_index", data.get("camera_index", 0))),
             width=int(data.get("width", 1920 if kind == KIND_IMX477 else 1280)),
             height=int(data.get("height", 1080 if kind == KIND_IMX477 else 720)),
-            fps=int(data.get("fps", 30)),
+            # IMX477 1080p Argus mode is 60 fps (30 selects the same mode awkwardly).
+            fps=int(data.get("fps", 60 if kind == KIND_IMX477 else 30)),
             flip_method=int(data.get("flip_method", 0)),
             prefer_gstreamer=bool(data.get("prefer_gstreamer", False)),
         )
@@ -124,8 +129,12 @@ class FrameSource:
         self.reader.release()
 
 
-def open_input_source(spec: InputSourceSpec) -> FrameSource:
-    """Open file / IMX477 CSI / USB webcam according to *spec*."""
+def open_input_source(spec: InputSourceSpec, *, require_scene: bool = False) -> FrameSource:
+    """Open file / IMX477 CSI / USB webcam according to *spec*.
+
+    ``require_scene`` (IMX477 only): when True, refuse blank/purple-fog frames.
+    Default False so Camera Test / Import Source / Run can open the same feed.
+    """
     kind = spec.kind
     if kind == KIND_FILE:
         if not spec.path:
@@ -141,9 +150,10 @@ def open_input_source(spec: InputSourceSpec) -> FrameSource:
                 height=spec.height,
                 fps=spec.fps,
                 flip_method=spec.flip_method,
+                require_scene=require_scene,
             )
         except RuntimeError as exc:
-            raise RuntimeError(f"{exc} {describe_csi_hardware()}") from exc
+            raise RuntimeError(f"{exc}\n{describe_csi_hardware()}") from exc
         return FrameSource(reader=reader, is_live=True, label=spec.label())
 
     if kind == KIND_USB:

@@ -32,12 +32,14 @@ class DetectionTracker:
         self.yolo = yolo
         # Not the legacy ``yolo_every_n_frames`` (30): old packages must also detect every frame
         # Default 2: optical flow bridges odd frames while locked (≈2× FPS on Orin).
+        # CPU mode (pipeline) may raise this to 4+.
         self.detect_every_n = max(1, int(tcfg.get("detect_every_n", 2)))
         self.adaptive_skip = bool(tcfg.get("adaptive_skip", True))
         self.target_fps = float(tcfg.get("target_fps", 20.0))
         self.skip_frames = 0
         self.stabilizer = TargetStabilizer(config.get("stabilizer"))
-        self.optical_flow = OpticalFlowTracker()
+        # Fewer LK points / smaller window — full-HD 200-corner flow was a CPU bottleneck.
+        self.optical_flow = OpticalFlowTracker(max_corners=80, win_size=15)
         self.filter_state = "searching"
         self.state = TrackerState(status=RuntimeState.SEARCHING)
         self._last_detect = -(10**9)
@@ -48,6 +50,12 @@ class DetectionTracker:
                                     "state": "searching", "tracking": False, "offset": None}
         self.stats = {"tracked": 0, "lost": 0, "yolo": 0, "landmarks": 0, "predicted": 0,
                       "optical_flow": 0, "searching": 0, "redetect": 0}
+
+    def set_stabilizer(self, cfg: Optional[Dict[str, Any]]) -> None:
+        """Apply new false-target filter settings (next frame), like desktop Live Test."""
+        self.stabilizer.configure(cfg)
+        if hasattr(self.yolo, "set_stabilizer"):
+            self.yolo.set_stabilizer(cfg)
 
     # Kept for API parity with MultiScaleHybridTracker; detection decides from the first frame.
     def initialize(self, frame: np.ndarray, roi: ROI) -> bool:
@@ -113,10 +121,21 @@ class DetectionTracker:
         self.stats["optical_flow"] += 1
         return True
 
+    def _detect_interval(self) -> int:
+        """YOLO spacing. Searching used to detect every frame and pinned CPU to ~4 FPS."""
+        if self.filter_state == CONFIRMING:
+            # Need temporal hits; still avoid full-rate inference on slow boards.
+            return max(1, min(2, self.detect_every_n))
+        return self.detect_every_n
+
     def update(self, frame: np.ndarray, frame_idx: Optional[int] = None) -> TrackerState:
         idx = int(frame_idx) if frame_idx is not None else self._last_detect + 1
-        due = idx - self._last_detect >= self.detect_every_n
-        if due or self.filter_state not in (LOCKED, COASTING) or not self._bridge(frame, idx):
+        due = (idx - self._last_detect) >= self._detect_interval()
+        if self.filter_state in (LOCKED, COASTING):
+            if due or not self._bridge(frame, idx):
+                self._detect(frame, idx)
+        elif due or self._last_detect < 0:
+            # searching / confirming: only run YOLO on the interval (not every frame)
             self._detect(frame, idx)
         if self.state.roi is not None:
             self.stats["tracked"] += 1
@@ -128,9 +147,12 @@ class DetectionTracker:
             self.state.trail = []
         if self.adaptive_skip and self.state.inference_ms > 0:
             est_fps = 1000.0 / max(self.state.inference_ms, 1)
-            if est_fps < self.target_fps * 0.4:
+            # Slow inference (CPU / heavy seg): drop source frames so wall FPS can rise.
+            if est_fps < self.target_fps * 0.35:
+                self.skip_frames = 3
+            elif est_fps < self.target_fps * 0.55:
                 self.skip_frames = 2
-            elif est_fps < self.target_fps * 0.7:
+            elif est_fps < self.target_fps * 0.8:
                 self.skip_frames = 1
             else:
                 self.skip_frames = 0
