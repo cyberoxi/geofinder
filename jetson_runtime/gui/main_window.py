@@ -51,11 +51,12 @@ from shared.qt_compat import (
 from shared.video_reader import VideoReader
 from jetson_runtime.gui.camera_test_dialog import open_camera_test
 from jetson_runtime.gui.confidence_control import ConfidenceControl
+from jetson_runtime.gui.image_controls import ImageControlBar, load_isp_settings
 from jetson_runtime.gui.serial_dialog import edit_serial_settings, load_serial_settings
 from jetson_runtime.gui.source_dialog import choose_input_source
 from jetson_runtime.gui.stabilizer_control import StabilizerFilterBar, describe_stabilizer
 from jetson_runtime.runtime.pipeline import run_runtime
-from jetson_runtime.runtime.sources import KIND_FILE, InputSourceSpec, open_input_source
+from jetson_runtime.runtime.sources import KIND_FILE, KIND_IMX477, InputSourceSpec, open_input_source
 
 
 class ProcessWorker(QThread):
@@ -72,8 +73,10 @@ class ProcessWorker(QThread):
         min_conf_cb=None,
         stabilizer_cb=None,
         stabilizer_cfg: Optional[dict] = None,
+        image_adjust_cb=None,
     ):
         super().__init__()
+        self.image_adjust_cb = image_adjust_cb
         self.package = package
         self.source_spec = source_spec
         self.serial_cfg = serial_cfg
@@ -120,6 +123,8 @@ class ProcessWorker(QThread):
                 min_conf_cb=self.min_conf_cb,
                 stabilizer_override=self.stabilizer_cfg,
                 stabilizer_cb=self.stabilizer_cb,
+                image_adjust=self.image_adjust_cb() if self.image_adjust_cb else None,
+                image_adjust_cb=self.image_adjust_cb,
             )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001
@@ -270,6 +275,10 @@ class JetsonMainWindow(QMainWindow):
         self.filters.set_change_callback(self._on_filters_changed)
         layout.addWidget(self.filters)
 
+        # Camera image: live colour normalisation (any source) + CSI ISP settings
+        self.image_ctl = ImageControlBar(on_isp_changed=self._on_isp_changed)
+        layout.addWidget(self.image_ctl)
+
         tl = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self._seek)
@@ -400,6 +409,15 @@ class JetsonMainWindow(QMainWindow):
 
     def _on_filters_changed(self, cfg: dict) -> None:
         self.statusBar().showMessage(describe_stabilizer(cfg))
+
+    def _on_isp_changed(self, cfg: dict) -> None:
+        """New CSI ISP settings: used the next time the camera opens."""
+        if self.input_spec is not None and self.input_spec.kind == KIND_IMX477:
+            self.input_spec.isp = dict(cfg)
+        if self.worker and self.worker.isRunning():
+            self.statusBar().showMessage("Camera settings saved — Stop and Run again to apply them")
+        else:
+            self.statusBar().showMessage("Camera settings saved (applied when the camera opens)")
 
     def import_package(self):
         path, _ = QFileDialog.getOpenFileName(self, "Deployment package", "", "ZIP (*.zip);;All (*)")
@@ -532,6 +550,8 @@ class JetsonMainWindow(QMainWindow):
         if self.reader:
             self.reader.release()
             self.reader = None
+        if self.input_spec.kind == KIND_IMX477:
+            self.input_spec.isp = load_isp_settings()
         serial_cfg = load_serial_settings()
         self.worker = ProcessWorker(
             self.package_path,
@@ -540,6 +560,7 @@ class JetsonMainWindow(QMainWindow):
             min_conf_cb=self.conf.fraction,
             stabilizer_cfg=self.filters.config(),
             stabilizer_cb=self.filters.config,
+            image_adjust_cb=self.image_ctl.config,
         )
         self.worker.frame_updated.connect(lambda fr, info: self._show(fr, info))
         self.worker.progress.connect(self._on_progress)

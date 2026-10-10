@@ -185,12 +185,17 @@ def run_runtime(
     min_conf_cb: Optional[Callable[[], Optional[float]]] = None,
     stabilizer_override: Optional[Dict[str, Any]] = None,
     stabilizer_cb: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+    image_adjust: Optional[Dict[str, Any]] = None,
+    image_adjust_cb: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """``min_conf`` overrides the package's min confidence; ``min_conf_cb`` is polled every frame
     so a GUI slider can change it while running (both 0–1).
 
     ``stabilizer_override`` / ``stabilizer_cb`` mirror the desktop Live Test filter toggles
     (geometry / temporal / aux-consistency).
+
+    ``image_adjust`` / ``image_adjust_cb``: live colour normalisation of frames before detection
+    (shared.image_adjust); falls back to the package ``runtime.yaml`` ``image_adjust`` section.
     """
     setup_logging()
     loader = PackageLoader(package_path)
@@ -255,6 +260,13 @@ def run_runtime(
         exporter.start_video(
             None, frame_source.info.width, frame_source.info.height, frame_source.info.fps
         )
+
+    from shared.image_adjust import ImageAdjuster, describe_adjust
+
+    color_ref = loader.color_stats()
+    adjuster = ImageAdjuster(image_adjust if image_adjust is not None else loader.runtime_config.get("image_adjust"),
+                             reference=color_ref)
+    logger.info("%s", describe_adjust(adjuster.cfg, color_ref is not None))
 
     serial_cfg = merge_serial_config(loader.runtime_config.get("serial"), serial_override)
     serial = SerialOffsetSender(serial_cfg)
@@ -350,7 +362,12 @@ def run_runtime(
                             want_stab.get("temporal"),
                             want_stab.get("landmark_consistency"),
                         )
+            if image_adjust_cb is not None and adjuster.configure(image_adjust_cb()):
+                logger.info("%s", describe_adjust(adjuster.cfg, color_ref is not None))
             t_frame = time.perf_counter()
+            raw_frame = frame
+            if adjuster.enabled:
+                frame = adjuster.apply(frame)  # the detector sees the colour-normalised frame
             state = tracker.update(frame, frame_idx=idx)
             dt = time.perf_counter() - t_frame
             fps = 1.0 / dt if dt > 0 else 0.0
@@ -388,13 +405,14 @@ def run_runtime(
             now = time.perf_counter()
             want_ui = frame_cb is not None and (now - last_ui) >= ui_interval
             if save_video or want_ui:
+                shown = frame if (not adjuster.enabled or adjuster.cfg["show_adjusted"]) else raw_frame
                 if isinstance(tracker, DetectionTracker):
                     # Same overlay as the desktop Live Test: target / aux objects / rejected /
                     # confirming, centre cross, arrow to the target, centre distance
-                    annotated = draw_localization(frame, tracker.dets, tracker.loc, yolo.class_names)
+                    annotated = draw_localization(shown, tracker.dets, tracker.loc, yolo.class_names)
                     _draw_footer(annotated, result, avg_fps=wall_fps)
                 else:
-                    annotated = draw_overlay(frame, result, trail=state.trail)
+                    annotated = draw_overlay(shown, result, trail=state.trail)
                 if save_video:
                     exporter.write_frame(annotated)
                 if want_ui:
@@ -442,6 +460,7 @@ def run_runtime(
         "package": loader.manifest.to_dict() if loader.manifest else {},
         "serial": {k: serial_cfg[k] for k in ("enabled", "port", "baudrate") if k in serial_cfg},
         "stabilizer": dict(tracker.stabilizer.cfg),
+        "image_adjust": dict(adjuster.cfg),
     }
     paths = exporter.finalize(loader.runtime_config, stats, video_path=source_label)
     frame_source.release()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -58,6 +58,7 @@ class InputSourceSpec:
     fps: int = 30
     flip_method: int = 0
     prefer_gstreamer: bool = False
+    isp: Dict[str, Any] = field(default_factory=dict)  # CSI image settings (shared.camera_isp)
 
     def label(self) -> str:
         if self.kind == KIND_FILE:
@@ -79,6 +80,7 @@ class InputSourceSpec:
             "fps": self.fps,
             "flip_method": self.flip_method,
             "prefer_gstreamer": self.prefer_gstreamer,
+            "isp": dict(self.isp),
         }
 
     @classmethod
@@ -98,6 +100,7 @@ class InputSourceSpec:
             fps=int(data.get("fps", 60 if kind == KIND_IMX477 else 30)),
             flip_method=int(data.get("flip_method", 0)),
             prefer_gstreamer=bool(data.get("prefer_gstreamer", False)),
+            isp=dict(data.get("isp") or {}),
         )
 
     @classmethod
@@ -151,6 +154,7 @@ def open_input_source(spec: InputSourceSpec, *, require_scene: bool = False) -> 
                 fps=spec.fps,
                 flip_method=spec.flip_method,
                 require_scene=require_scene,
+                isp=spec.isp,
             )
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}\n{describe_csi_hardware()}") from exc

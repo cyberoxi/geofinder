@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -25,6 +25,7 @@ from desktop_app.atlas.model import (
     point_in_ring,
 )
 from desktop_app.atlas.tour import tour_keys, tour_lights
+from desktop_app.satellite.camera_model import CameraSim
 from desktop_app.satellite.scene import draw_scene_preview, meters_per_pixel
 from desktop_app.satellite.tiles import TILE_SIZE, count_tiles, fetch_mosaic
 from shared.landmarks import SceneLayout
@@ -51,6 +52,7 @@ class AtlasBuildOptions:
     ir_fraction: float = 0.1
     duration_s: float = 8.0
     fps: float = 24.0
+    camera_sim: Dict[str, Any] = field(default_factory=dict)  # CameraSim snapshot (empty = off)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "AtlasBuildOptions":
@@ -322,6 +324,8 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
     from desktop_app.satellite.render import render_path_videos, render_scene_videos
 
     opts = AtlasBuildOptions.from_dict(atlas.settings.get("build", {}))
+    sim = CameraSim.from_dict(opts.camera_sim) if opts.camera_sim else None
+    sim = sim if sim is not None and sim.any_enabled else None
     n = len(atlas.chunks)
     for idx, chunk in enumerate(atlas.chunks):
         if chunk.get("status") not in ("scanned",):
@@ -378,7 +382,7 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
                 mosaic, layout, atlas.chunk_dir(chunk["id"]) / f"videos_{fi}",
                 n_videos=nv, night_fraction=night_f, ir_fraction=ir_f,
                 duration_s=opts.duration_s, fps=opts.fps, seed=int(chunk["id"]) * 17 + fi,
-                keep_classes=keep, progress_cb=_p,
+                keep_classes=keep, camera_sim=sim, progress_cb=_p,
             )
             _add(res)
             if fi == 0:
@@ -400,7 +404,7 @@ def render_chunks(atlas: RegionAtlas, cache_dir: Path, progress_cb: ProgressCb, 
 
             _add(render_path_videos(
                 mosaic, layout, keys, atlas.chunk_dir(chunk["id"]) / "tours", lights=(light,), fps=opts.fps,
-                name=f"tour{ti}", seed=int(chunk["id"]) * 31 + ti, keep_classes=keep, progress_cb=_pt,
+                name=f"tour{ti}", seed=int(chunk["id"]) * 31 + ti, keep_classes=keep, camera_sim=sim, progress_cb=_pt,
             ))
         chunk["videos"] = videos
         chunk["status"] = "rendered"

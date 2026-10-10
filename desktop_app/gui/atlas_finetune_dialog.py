@@ -108,6 +108,14 @@ class AtlasFinetuneDialog(QDialog):
         self.night = QCheckBox("Night / thermal variants")
         self.night.setChecked(True)
         form.addRow("", self.night)
+        from desktop_app.gui.camera_sim_dialog import load_camera_sim
+
+        self.camsim_label = QLabel(load_camera_sim().describe())
+        self.camsim_label.setWordWrap(True)
+        self.camsim_label.setStyleSheet("color:#8af;")
+        self.b_camsim = QPushButton("Camera simulation…")
+        self.b_camsim.clicked.connect(self._edit_camera_sim)
+        form.addRow(self.b_camsim, self.camsim_label)
         self.package = QCheckBox("Build Jetson package")
         self.package.setChecked(True)
         form.addRow("", self.package)
@@ -127,9 +135,14 @@ class AtlasFinetuneDialog(QDialog):
         if self.atlas_combo.count():
             self._load_atlas(self.atlas_combo.currentData())
 
+    def _edit_camera_sim(self) -> None:
+        from desktop_app.gui.camera_sim_dialog import edit_camera_sim
+
+        self.camsim_label.setText(edit_camera_sim(self).describe())
+
     def _mode_changed(self) -> None:
         instant = self.mode.currentData() == "instant"
-        for w in (self.n_videos, self.epochs, self.freeze, self.night):
+        for w in (self.n_videos, self.epochs, self.freeze, self.night, self.b_camsim):
             w.setEnabled(not instant)
         self.package.setEnabled(instant)  # fine-tune: the training pipeline builds the package
         self._ok.setText("Create (instant)" if instant else "Create && fine-tune")

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 
 from desktop_app.project_manager.manager import ProjectManager
@@ -110,6 +111,7 @@ class PackageBuilder:
         if self.project.scene_path.exists():
             shutil.copy2(self.project.scene_path, staging / "reference" / "scene.json")
             scene_rel = "reference/scene.json"
+        self._write_color_stats(staging / "reference" / "color_stats.json")
 
         manifest = Manifest(
             project_name=self.project.meta.project_name,
@@ -175,6 +177,16 @@ python3 tools/build_tensorrt.py --onnx model/model.onnx --output model/model.eng
                     # Ensure no absolute paths in archive
                     zf.write(path, arcname=path.relative_to(staging).as_posix())
         return zip_path
+
+    def _write_color_stats(self, dest: Path) -> None:
+        """Training-imagery colours (scene mosaic) — the Jetson image adjuster matches camera frames to them."""
+        from shared.image_adjust import image_color_stats
+
+        mosaic = self.project.scene_dir / "mosaic.jpg"
+        img = cv2.imread(str(mosaic)) if mosaic.exists() else None
+        if img is None:
+            return
+        dest.write_text(json.dumps({**image_color_stats(img), "source": "scene mosaic"}), encoding="utf-8")
 
     def _fresh_onnx(self, best_pt: Path, imgsz: int) -> Optional[Path]:
         """ONNX exported from ``best_pt`` (re-exported if the existing one is older); None on failure."""

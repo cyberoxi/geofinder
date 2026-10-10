@@ -1,8 +1,9 @@
 """Synthetic camera paths over a satellite mosaic with exact per-frame labels.
 
 Each frame is an affine view of the mosaic (centre, height in mosaic px,
-rotation).  The same affine maps every scene object into the frame, so the
-target and landmark labels are exact — no manual annotation needed.
+rotation) — or, with pitch / roll, a tilted pinhole view (homography, see oblique.py).
+The same transform maps every scene object into the frame, so the target and landmark
+labels are exact — no manual annotation needed.
 """
 
 from __future__ import annotations
@@ -10,9 +11,9 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -33,6 +34,8 @@ class Pose:
     cy: float
     view_h: float  # mosaic px covered by the frame height
     angle: float  # degrees (camera heading)
+    pitch: float = 0.0  # degrees of forward tilt from straight down (oblique view)
+    roll: float = 0.0  # degrees of bank
 
 
 @dataclass
@@ -156,8 +159,9 @@ def make_night_mosaic(mosaic: np.ndarray, meters_per_px: float, rng: random.Rand
 class MosaicCamera:
     """Renders affine views with a mip pyramid (no aliasing when zoomed out)."""
 
-    def __init__(self, mosaic: np.ndarray, out_size: Tuple[int, int]):
+    def __init__(self, mosaic: np.ndarray, out_size: Tuple[int, int], fov_v: float = 45.0):
         self.out_w, self.out_h = out_size
+        self.fov_v = float(fov_v)  # vertical field of view — only used by tilted poses
         self.pyr = [mosaic]
         while min(self.pyr[-1].shape[:2]) > 2 * max(self.out_w, self.out_h) // 2 and len(self.pyr) < 8:
             self.pyr.append(cv2.pyrDown(self.pyr[-1]))
@@ -168,7 +172,12 @@ class MosaicCamera:
         return self.out_w / self.out_h
 
     def matrix(self, pose: Pose) -> np.ndarray:
-        """2x3 affine: mosaic px → frame px."""
+        """2x3 affine (straight down) or 3x3 homography (tilted pose): mosaic px → frame px."""
+        if pose.pitch or pose.roll:
+            from desktop_app.satellite.oblique import ground_homography
+
+            return ground_homography(pose.cx, pose.cy, pose.view_h, pose.angle, pose.pitch, pose.roll,
+                                     self.out_w, self.out_h, self.fov_v)
         s = self.out_h / pose.view_h
         a = math.radians(pose.angle)
         c, si = math.cos(a) * s, math.sin(a) * s
@@ -187,22 +196,39 @@ class MosaicCamera:
 
     def fit(self, pose: Pose) -> Pose:
         vh = min(pose.view_h, self.max_view_h(pose.cx, pose.cy, pose.angle))
-        return Pose(pose.cx, pose.cy, vh, pose.angle)
+        fitted = replace(pose, view_h=vh)
+        if fitted.pitch or fitted.roll:
+            from desktop_app.satellite.oblique import fit_tilt
 
-    def render(self, pose: Pose) -> Tuple[np.ndarray, np.ndarray]:
+            fitted = fit_tilt(self, fitted)
+        return fitted
+
+    def render(self, pose: Pose, pre: Optional[np.ndarray] = None, pre_scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+        """Frame + the mosaic→frame transform used for labels.
+
+        ``pre`` (3x3, scale ``pre_scale``) is applied to the image only — the lens simulation
+        renders a slightly wider pinhole view and then distorts it back to the frame.
+        """
         M = self.matrix(pose)
-        s = self.out_h / pose.view_h
+        s = self.out_h / pose.view_h * pre_scale
         level = 0
         while level + 1 < len(self.pyr) and s * (2 ** (level + 1)) <= 1.0:
             level += 1
-        Ml = M.copy()
-        Ml[:, :2] *= 2**level
-        img = cv2.warpAffine(
-            self.pyr[level],
-            Ml,
-            (self.out_w, self.out_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT,
+        if M.shape == (2, 3) and pre is None:
+            Ml = M.copy()
+            Ml[:, :2] *= 2**level
+            img = cv2.warpAffine(
+                self.pyr[level],
+                Ml,
+                (self.out_w, self.out_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT,
+            )
+            return img, M
+        M3 = M if M.shape == (3, 3) else np.vstack([M, [0.0, 0.0, 1.0]])
+        Mr = (pre @ M3 if pre is not None else M3) @ np.diag([2.0**level, 2.0**level, 1.0])
+        img = cv2.warpPerspective(
+            self.pyr[level], Mr, (self.out_w, self.out_h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
         )
         return img, M
 
@@ -215,14 +241,28 @@ def frame_labels(
     min_side_px: float = 10.0,
     min_visible: Dict[int, float] | None = None,
     keep: Optional[set] = None,
+    point_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
 ) -> List[Tuple[int, List[List[float]]]]:
-    """Project every scene object; keep those sufficiently visible (and covered by the imagery)."""
+    """Project every scene object; keep those sufficiently visible (and covered by the imagery).
+
+    ``M`` is a 2x3 affine or a 3x3 homography (tilted camera). ``point_fn`` maps projected frame
+    points once more (lens distortion); polygon edges are densified first so they can bend.
+    """
     min_visible = min_visible or {}
     out = []
     for cid in range(len(layout.classes)):
         if keep is not None and cid not in keep:
             continue
-        poly = apply_affine(layout.polygon(cid), M)
+        if M.shape == (3, 3):
+            from desktop_app.satellite.oblique import project
+
+            poly = project(layout.polygon(cid), M)
+            if poly is None:
+                continue  # partly behind the camera
+        else:
+            poly = apply_affine(layout.polygon(cid), M)
+        if point_fn is not None:
+            poly = point_fn(_densify(poly))
         full = polygon_area_abs(poly)
         if full <= 0 or math.sqrt(full) < min_side_px:
             continue
@@ -234,6 +274,13 @@ def frame_labels(
             continue
         out.append((cid, [[round(float(x), 2), round(float(y), 2)] for x, y in clipped]))
     return out
+
+
+def _densify(poly: np.ndarray, per_edge: int = 6) -> np.ndarray:
+    pts = np.asarray(poly, np.float32).reshape(-1, 2)
+    nxt = np.roll(pts, -1, axis=0)
+    t = (np.arange(per_edge, dtype=np.float32) / per_edge)[None, :, None]
+    return (pts[:, None, :] + (nxt - pts)[:, None, :] * t).reshape(-1, 2)
 
 
 # ---------------------------------------------------------------- camera paths
@@ -349,20 +396,30 @@ def render_labeled_video(
     progress_cb: Optional[ProgressCb] = None,
     frame_cb: Optional[FrameCb] = None,
     progress_label: str = "Rendering",
+    sensor: Optional[Any] = None,
 ) -> Tuple[Path, Path]:
-    """Write the video plus ``<video>.labels.json`` with exact per-frame objects."""
+    """Write the video plus ``<video>.labels.json`` with exact per-frame objects.
+
+    ``sensor``: a ``sensor_sim.SensorSim`` (real camera + lens look; labels follow the lens distortion).
+    """
     np_rng = np.random.default_rng(seed)
     labels: List[List[Tuple[int, List[List[float]]]]] = []
     scales: List[float] = []
+    point_fn = sensor.lens.distort_points if sensor is not None and sensor.lens.active else None
 
     def frames():
         for i, pose in enumerate(poses):
-            img, M = cam.render(pose)
+            if sensor is not None:
+                img, M = cam.render(pose, pre=sensor.lens.pre, pre_scale=sensor.lens.pre_scale)
+            else:
+                img, M = cam.render(pose)
             if photometric is not None:
                 img = photometric.apply(img, np_rng)
+            if sensor is not None:
+                img = sensor.apply(img, _frame_motion(cam, poses, i), np_rng)
             if attribution and (i == 0 or i == len(poses) - 1):
                 img = _overlay_attribution(img)
-            labels.append(frame_labels(layout, M, cam.out_w, cam.out_h, keep=keep_classes))
+            labels.append(frame_labels(layout, M, cam.out_w, cam.out_h, keep=keep_classes, point_fn=point_fn))
             scales.append(float(cam.out_h / pose.view_h))
             yield img
 
@@ -395,6 +452,17 @@ def render_labeled_video(
         encoding="utf-8",
     )
     return video_path, labels_path
+
+
+def _frame_motion(cam: MosaicCamera, poses: Sequence[Pose], i: int) -> Tuple[float, float]:
+    """Image-centre motion (frame px per frame) — drives the sensor's motion blur."""
+    if len(poses) < 2:
+        return 0.0, 0.0
+    a, b = poses[max(0, i - 1)], poses[min(len(poses) - 1, max(1, i))]
+    M = cam.matrix(a)
+    p = np.array([b.cx, b.cy, 1.0])
+    q = (M @ p) if M.shape == (2, 3) else (M @ p)[:2] / max(1e-9, (M @ p)[2])
+    return float(q[0] - cam.out_w / 2.0), float(q[1] - cam.out_h / 2.0)
 
 
 def labels_path_for(video_path: str | Path) -> Path:

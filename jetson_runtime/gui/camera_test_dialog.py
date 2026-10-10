@@ -12,6 +12,7 @@ from jetson_runtime.runtime.sources import (
     InputSourceSpec,
     open_input_source,
 )
+from jetson_runtime.gui.image_controls import edit_isp_settings, load_isp_settings
 from shared.video_reader import frame_lacks_scene
 from shared.qt_compat import (
     QComboBox,
@@ -147,6 +148,10 @@ class CameraTestDialog(QDialog):
         self.btn_stop.setEnabled(False)
         row.addWidget(self.btn_start)
         row.addWidget(self.btn_stop)
+        self.btn_isp = QPushButton("Camera image settings… / تنظیمات تصویر")
+        self.btn_isp.setToolTip("IMX477 white balance, exposure, gain, noise reduction — camera restarts to apply")
+        self.btn_isp.clicked.connect(self._edit_isp)
+        row.addWidget(self.btn_isp)
         row.addStretch(1)
         root.addLayout(row)
 
@@ -189,6 +194,7 @@ class CameraTestDialog(QDialog):
         kind = self.kind.currentData()
         busy = self._timer.isActive() or (self._worker is not None and self._worker.isRunning())
         is_csi = kind == KIND_IMX477
+        self.btn_isp.setEnabled(is_csi)
         self.sensor_id.setEnabled(is_csi and not busy)
         self.usb_index.setEnabled(not is_csi and not busy)
         self.flip.setEnabled(is_csi and not busy)
@@ -218,7 +224,16 @@ class CameraTestDialog(QDialog):
             fps=int(self.fps.value()),
             flip_method=int(self.flip.value()),
             prefer_gstreamer=False,
+            isp=load_isp_settings() if kind == KIND_IMX477 else {},
         )
+
+    def _edit_isp(self) -> None:
+        """Change CSI image settings; a running camera re-opens so the preview shows them."""
+        if edit_isp_settings(self) is None:
+            return
+        running = self._timer.isActive() or (self._worker is not None and self._worker.isRunning())
+        if running and self.kind.currentData() == KIND_IMX477:
+            self._start()
 
     def _start(self) -> None:
         self._stop()

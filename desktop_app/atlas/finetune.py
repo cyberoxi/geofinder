@@ -161,6 +161,7 @@ def prepare_subregion_project(
     ir_fraction: float = 0.1,
     freeze: int = 10,
     instant: bool = False,
+    camera_sim: Optional[Any] = None,
     cache_dir: str | Path | None = None,
     progress_cb: Optional[ProgressCb] = None,
     should_stop: Optional[StopCb] = None,
@@ -168,6 +169,7 @@ def prepare_subregion_project(
     """New project with labeled videos of the target, linked to the atlas base model. Returns its folder.
 
     ``instant``: also install the base weights as this project's model (no training needed).
+    ``camera_sim``: optional ``CameraSim`` (tilt / sensor + lens / altitude) for the rendered videos.
     """
     from desktop_app.project_manager.manager import ProjectManager
     from desktop_app.satellite.render import render_scene_videos
@@ -201,7 +203,7 @@ def prepare_subregion_project(
         res = render_scene_videos(
             prep["mosaic"], prep["layout"], pm.exports_dir / "satellite",
             n_videos=max(1, int(n_videos)), night_fraction=night_fraction, ir_fraction=ir_fraction,
-            keep_classes=prep["keep"], progress_cb=_render,
+            keep_classes=prep["keep"], camera_sim=camera_sim, progress_cb=_render,
         )
         if stop():
             raise RuntimeError("Stopped by user")

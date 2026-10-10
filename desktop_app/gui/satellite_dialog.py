@@ -51,6 +51,7 @@ from desktop_app.satellite import (
     render_scene_videos,
 )
 from desktop_app.satellite.archives import ArchiveScene, attach_archive_extras
+from desktop_app.satellite.camera_model import CameraSim
 from desktop_app.satellite.objects import sam_available
 from desktop_app.satellite.map_widget import SatelliteMapPanel
 from desktop_app.satellite.tiles import layer_max_zoom
@@ -294,6 +295,17 @@ class SatelliteVideoDialog(QDialog):
         self.ir_pct.setToolTip("Share rendered as thermal-like (IR) imagery")
         form.addWidget(self.ir_pct)
         self.use_ir.toggled.connect(self.ir_pct.setEnabled)
+
+        from desktop_app.gui.camera_sim_dialog import load_camera_sim
+
+        self.camsim_label = QLabel(load_camera_sim().describe())
+        self.camsim_label.setWordWrap(True)
+        self.camsim_label.setStyleSheet("color:#8af;")
+        form.addWidget(self.camsim_label)
+        b_camsim = QPushButton("Camera simulation… / شبیه‌سازی دوربین")
+        b_camsim.setToolTip("Tilt, real sensor + lens look and altitude range for these training videos")
+        b_camsim.clicked.connect(self._edit_camera_sim)
+        form.addWidget(b_camsim)
 
         self.run_pipeline, pipe_row = _wrap_check(
             "Then run full pipeline (dataset → train → ONNX → package)",
@@ -862,6 +874,18 @@ class SatelliteVideoDialog(QDialog):
         self._worker.failed.connect(self._on_worker_failed)
         self._worker.start()
 
+    def _edit_camera_sim(self) -> None:
+        from desktop_app.gui.camera_sim_dialog import edit_camera_sim
+
+        self.camsim_label.setText(edit_camera_sim(self).describe())
+
+    @staticmethod
+    def _camera_sim_dict() -> Optional[Dict[str, Any]]:
+        from desktop_app.gui.camera_sim_dialog import active_camera_sim
+
+        sim = active_camera_sim()
+        return sim.to_dict() if sim else None
+
     def _on_prepared(self, prepared: object) -> None:
         if not self._busy:
             return
@@ -905,6 +929,7 @@ class SatelliteVideoDialog(QDialog):
                 render_modes=params["modes"],
                 duration_s=params["duration_s"],
                 fps=params["fps"],
+                camera_sim=CameraSim.from_dict(params["camera_sim"]) if params.get("camera_sim") else None,
                 progress_cb=progress,
                 frame_cb=frame,
             )
@@ -1076,5 +1101,6 @@ class SatelliteVideoDialog(QDialog):
             "review": self.review.isChecked(),
             "night_fraction": (self.night_pct.value() / 100.0) if self.use_night.isChecked() else 0.0,
             "ir_fraction": (self.ir_pct.value() / 100.0) if self.use_ir.isChecked() else 0.0,
+            "camera_sim": self._camera_sim_dict(),
         }
 

@@ -94,6 +94,11 @@ class InputSourceDialog(QDialog):
         self.flip.setToolTip("nvvidconv flip-method (0 = none)")
         form.addRow("Flip method (CSI):", self.flip)
 
+        self.btn_isp = QPushButton("Camera image settings… / تنظیمات تصویر دوربین")
+        self.btn_isp.setToolTip("IMX477 white balance, exposure, gain, noise reduction, sharpening")
+        self.btn_isp.clicked.connect(self._edit_isp)
+        form.addRow("CSI image:", self.btn_isp)
+
         self.csi_status = QLabel(describe_csi_hardware())
         self.csi_status.setWordWrap(True)
         self.csi_status.setStyleSheet("color:#fbbf24;")
@@ -129,6 +134,7 @@ class InputSourceDialog(QDialog):
         self.sensor_id.setEnabled(is_csi)
         self.usb_index.setEnabled(is_usb)
         self.flip.setEnabled(is_csi)
+        self.btn_isp.setEnabled(is_csi)
         # Resolution applies to live cameras; file uses its own size.
         self.width.setEnabled(not is_file)
         self.height.setEnabled(not is_file)
@@ -140,6 +146,11 @@ class InputSourceDialog(QDialog):
         if is_usb and self.width.value() > 1920 and self._initial.kind != KIND_USB:
             self.width.setValue(1280)
             self.height.setValue(720)
+
+    def _edit_isp(self) -> None:
+        from jetson_runtime.gui.image_controls import edit_isp_settings
+
+        edit_isp_settings(self)
 
     def _browse(self) -> None:
         start = self.path.text().strip() or str(Path.home())
@@ -167,7 +178,16 @@ class InputSourceDialog(QDialog):
             fps=int(self.fps.value()),
             flip_method=int(self.flip.value()),
             prefer_gstreamer=False,
+            isp=_isp_for(kind),
         )
+
+
+def _isp_for(kind: str) -> dict:
+    if kind != KIND_IMX477:
+        return {}
+    from jetson_runtime.gui.image_controls import load_isp_settings
+
+    return load_isp_settings()
 
 
 def choose_input_source(

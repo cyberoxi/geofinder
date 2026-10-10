@@ -160,11 +160,14 @@ def imx477_gstreamer_pipeline(
     height: int = 1080,
     fps: int = 30,
     flip_method: int = 0,
+    isp: Optional[dict] = None,
 ) -> str:
-    """Argus CSI pipeline for IMX477 (and similar) on Jetson."""
+    """Argus CSI pipeline for IMX477 (and similar) on Jetson. ``isp``: see shared.camera_isp."""
+    from shared.camera_isp import argus_properties
+
     width, height, fps = _normalize_imx477_mode(width, height, fps)
     return (
-        f"nvarguscamerasrc sensor-id={int(sensor_id)} ! "
+        f"nvarguscamerasrc sensor-id={int(sensor_id)}{argus_properties(isp)} ! "
         f"video/x-raw(memory:NVMM), width=(int){int(width)}, height=(int){int(height)}, "
         f"framerate=(fraction){int(fps)}/1, format=(string)NV12 ! "
         f"nvvidconv flip-method={int(flip_method)} ! "
@@ -240,8 +243,9 @@ class VideoReader:
         fps: int = 30,
         flip_method: int = 0,
         require_scene: bool = False,
+        isp: Optional[dict] = None,
     ) -> "VideoReader":
-        """Open Jetson CSI IMX477 via Argus (requires working GPU/ISP)."""
+        """Open Jetson CSI IMX477 via Argus (requires working GPU/ISP); ``isp`` = camera image settings."""
         obj = cls._blank_live(f"imx477:{int(sensor_id)}")
         sid = int(sensor_id)
         width, height, fps = _normalize_imx477_mode(width, height, fps)
@@ -255,6 +259,7 @@ class VideoReader:
             height=height,
             fps=fps,
             flip_method=flip_method,
+            isp=isp,
         )
         if obj._try_open(pipe, cv2.CAP_GSTREAMER, rewind=False):
             obj.backend = "imx477-argus"

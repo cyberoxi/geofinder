@@ -61,3 +61,9 @@ class PackageLoader:
 
     def descriptors_path(self) -> Path:
         return self.reference_dir() / "descriptors.npz"
+
+    def color_stats(self) -> Optional[Dict[str, Any]]:
+        """Training-imagery colour statistics (newer packages), for the live image adjuster."""
+        from shared.image_adjust import load_color_stats
+
+        return load_color_stats(self.reference_dir() / "color_stats.json")

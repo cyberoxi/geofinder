@@ -137,6 +137,15 @@ class AtlasBuildDialog(QDialog):
         self.night = QCheckBox("Night / thermal variants")
         self.night.setChecked(True)
         form.addRow("", self.night)
+        from desktop_app.gui.camera_sim_dialog import load_camera_sim
+
+        self.camsim_label = QLabel(load_camera_sim().describe())
+        self.camsim_label.setWordWrap(True)
+        self.camsim_label.setStyleSheet("color:#8af;")
+        b_camsim = QPushButton("Camera simulation…")
+        b_camsim.setToolTip("Tilt, real sensor + lens look and altitude range (stored with the atlas on Build)")
+        b_camsim.clicked.connect(self._edit_camera_sim)
+        form.addRow(b_camsim, self.camsim_label)
         self.use_sam = QCheckBox("FastSAM object proposals")
         try:
             from desktop_app.satellite.objects import sam_available
@@ -182,9 +191,18 @@ class AtlasBuildDialog(QDialog):
         restore_map_view(self.map_panel)
 
     # ------------------------------------------------------------ helpers
+    def _edit_camera_sim(self) -> None:
+        from desktop_app.gui.camera_sim_dialog import edit_camera_sim
+
+        self.camsim_label.setText(edit_camera_sim(self).describe())
+
     def _options(self) -> AtlasBuildOptions:
+        from desktop_app.gui.camera_sim_dialog import active_camera_sim
+
         night = self.night.isChecked()
+        sim = active_camera_sim()
         return AtlasBuildOptions(
+            camera_sim=sim.to_dict() if sim else {},
             landmarks_per_chunk=self.lm_per_chunk.value(),
             max_landmarks=self.max_lm.value(),
             videos_per_chunk=self.videos.value(),

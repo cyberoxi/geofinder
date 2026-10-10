@@ -19,6 +19,8 @@ from desktop_app.satellite.synth import (
     render_labeled_video,
     zoom_path,
 )
+from desktop_app.satellite import camera_sim as csim
+from desktop_app.satellite.camera_model import CameraSim
 from shared.landmarks import SceneLayout
 
 ProgressCb = Callable[[int, int, str], None]
@@ -39,6 +41,7 @@ def render_scene_videos(
     out_size: Tuple[int, int] = (1280, 720),
     seed: int = 0,
     keep_classes: Optional[set] = None,
+    camera_sim: Optional[CameraSim] = None,
     progress_cb: Optional[ProgressCb] = None,
     frame_cb: Optional[FrameCb] = None,
 ) -> Dict[str, Any]:
@@ -49,6 +52,7 @@ def render_scene_videos(
     (same area / zoom from different sources or dates); videos cycle through them.
     ``night_fraction`` / ``ir_fraction`` of the videos use simulated night / thermal views.
     ``keep_classes``: only these class ids are labeled (None = all).
+    ``camera_sim``: optional real-camera simulation (tilt / sensor + lens / altitude range).
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -94,6 +98,7 @@ def render_scene_videos(
         plans = pans or [{"kind": "pan", "angle": 0.0, "view": 4.0, "length": 3.0, "photo": False}]
 
     n_frames = max(2, int(round(duration_s * fps)))
+    sim_plans = csim.plan_videos(camera_sim, len(plans), seed)
     results: Dict[str, Any] = {}
     videos: List[Dict[str, Any]] = []
     for i, plan in enumerate(plans):
@@ -127,11 +132,14 @@ def render_scene_videos(
                 view_factor=plan["view"],
                 length_factor=plan["length"],
             )
+        sim_rng = random.Random(seed * 1000 + i + 555)
+        poses = csim.adjust_poses(poses, cam, camera_sim, sim_plans[i], layout.meters_per_px, sim_rng)
+        sensor = csim.make_sensor(camera_sim, cam, sim_plans[i], sim_rng, light)
         if light == "day":
-            photo = Photometric.random(rng) if plan.get("photo") else None
+            photo = Photometric.random(rng) if plan.get("photo") and sensor is None else None
         else:  # low-light sensor: noise + softness, no daylight colour jitter
             photo = Photometric(noise=rng.uniform(4, 12), blur=rng.choice([0, 3, 3, 5]))
-        tag = "" if light == "day" else f"_{light}"
+        tag = ("" if light == "day" else f"_{light}") + csim.tag(sim_plans[i])
         name = f"satellite_{plan['kind']}_{i:02d}{tag}.mp4"
 
         def _cb(done: int, total: int, msg: str, i: int = i) -> None:
@@ -151,8 +159,9 @@ def render_scene_videos(
             progress_cb=_cb,
             frame_cb=frame_cb,
             progress_label=f"Rendering {plan['kind']} ({light}, {sources[src_idx][0]})",
-            extra_meta={"light": light, "source": sources[src_idx][0]},
+            extra_meta={"light": light, "source": sources[src_idx][0], "camera_sim": _sim_meta(camera_sim, sim_plans[i])},
             keep_classes=keeps[src_idx],
+            sensor=sensor,
         )
         videos.append({"path": vpath, "labels": lpath, "kind": plan["kind"], "light": light, "source": sources[src_idx][0]})
         results.setdefault(plan["kind"], vpath)
@@ -175,12 +184,14 @@ def render_path_videos(
     name: str = "custom",
     seed: int = 0,
     keep_classes: Optional[set] = None,
+    camera_sim: Optional[CameraSim] = None,
     progress_cb: Optional[ProgressCb] = None,
     frame_cb: Optional[FrameCb] = None,
 ) -> Dict[str, Any]:
     """Render a user-designed camera path (CameraKey list) as labeled videos: one per light × source.
 
     ``keep_classes``: only these class ids are labeled (None = all).
+    ``camera_sim``: tilt + sensor/lens simulation (the designed altitudes are kept as they are).
     """
     from desktop_app.satellite.synth import path_from_keyframes
 
@@ -191,6 +202,7 @@ def render_path_videos(
         raw = raw[:1]
     poses = path_from_keyframes(keys, fps)
     jobs = [(item, light) for item in raw for light in lights]
+    sim_plans = csim.plan_videos(camera_sim, len(jobs) + 1, seed)[1:]  # paths have no canonical video
     videos: List[Dict[str, Any]] = []
     for j, (item, light) in enumerate(jobs):
         src_name, img = str(item[0]), item[1]
@@ -208,6 +220,10 @@ def render_path_videos(
         cam = MosaicCamera(view, out_size)
         fitted = [cam.fit(p) for p in poses]
         tag = "night_real" if real_night else light
+        sim_rng = random.Random(seed * 1000 + j + 777)
+        fitted = csim.adjust_poses(fitted, cam, camera_sim, sim_plans[j], layout.meters_per_px, sim_rng,
+                                   use_altitude=False)
+        sensor = csim.make_sensor(camera_sim, cam, sim_plans[j], sim_rng, "day" if mode == "day" else mode)
         photo = None if mode == "day" else Photometric(noise=6.0, blur=3)
 
         def _cb(done: int, total: int, msg: str, j: int = j) -> None:
@@ -218,7 +234,7 @@ def render_path_videos(
             cam,
             fitted,
             layout,
-            out / f"path_{_safe(name)}_{j:02d}_{tag}.mp4",
+            out / f"path_{_safe(name)}_{j:02d}_{tag}{csim.tag(sim_plans[j])}.mp4",
             fps=fps,
             photometric=photo,
             seed=seed + j,
@@ -226,10 +242,19 @@ def render_path_videos(
             progress_cb=_cb,
             frame_cb=frame_cb,
             progress_label=f"Rendering {name} ({tag}, {src_name})",
-            extra_meta={"light": tag, "source": src_name, "path": [k.to_dict() for k in keys]},
+            extra_meta={"light": tag, "source": src_name, "path": [k.to_dict() for k in keys],
+                        "camera_sim": _sim_meta(camera_sim, sim_plans[j])},
             keep_classes=keep,
+            sensor=sensor,
         )
         videos.append({"path": vpath, "labels": lpath, "kind": "custom", "light": tag, "source": src_name})
     if progress_cb:
         progress_cb(100, 100, "Done")
     return {"videos": videos}
+
+
+def _sim_meta(sim: Optional[CameraSim], plan: Dict[str, bool]) -> Optional[Dict[str, Any]]:
+    if sim is None or not sim.any_enabled:
+        return None
+    return {"camera": sim.camera, "lens": sim.lens, "fov_v": round(sim.fov_v(), 2), **plan,
+            "altitude": [sim.alt_min_m, sim.alt_max_m] if sim.altitude else None}

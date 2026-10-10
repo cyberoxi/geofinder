@@ -18,6 +18,7 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Satellite API | `desktop_app/satellite/__init__.py` (re-exports only) |
 | Fetch + landmarks | `desktop_app/satellite/prepare.py` |
 | Labeled video render | `desktop_app/satellite/render.py` |
+| Camera simulation for training videos (tilt / sensor+lens / altitude) | `desktop_app/satellite/camera_model.py` (settings, lens presets), `oblique.py`, `sensor_sim.py`, `camera_sim.py` (per-video apply); UI `desktop_app/gui/camera_sim_dialog.py` |
 | Test videos (pos/neg) | `desktop_app/satellite/test_videos.py` |
 | Simple zoom/pan gen | `desktop_app/satellite/generate.py` |
 | Tiles / Wayback | `desktop_app/satellite/tiles.py` |
@@ -38,6 +39,7 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Jetson per-frame detect + stabilizer (same logic as desktop Live Test) | `jetson_runtime/runtime/detect_tracker.py` (legacy feature-only: `hybrid_tracker.py`) |
 | Jetson video / CSI / USB input | `jetson_runtime/runtime/sources.py`, `shared/video_reader.py`; UI `jetson_runtime/gui/source_dialog.py` |
 | Jetson camera live preview / test | `jetson_runtime/gui/camera_test_dialog.py` |
+| Jetson camera image: CSI ISP (WB / exposure / gain / NR) + live colour normalisation | `shared/camera_isp.py`, `shared/image_adjust.py`; UI `jetson_runtime/gui/image_controls.py`; package colours `reference/color_stats.json` |
 | Jetson serial dx/dy | `shared/serial_out.py`, `jetson_runtime/gui/serial_dialog.py` (re-export: `jetson_runtime/serial_out.py`) |
 
 ## Token rules

@@ -340,11 +340,14 @@ class PipelineActionsMixin:
         self._auto_labels_cache.clear()
         out_dir = self.project.exports_dir / f"satellite_{np.random.randint(1e9):09d}"
         n_videos = max(1, len(auto_ids) or 6)
+        from desktop_app.gui.camera_sim_dialog import active_camera_sim
+
+        camera_sim = active_camera_sim()
 
         def job(progress, frame):
             res = render_scene_videos(
                 prepared.all_mosaics(), layout, out_dir, n_videos=n_videos,
-                night_fraction=0.25, ir_fraction=0.15, progress_cb=progress, frame_cb=frame,
+                night_fraction=0.25, ir_fraction=0.15, camera_sim=camera_sim, progress_cb=progress, frame_cb=frame,
             )
             res["run_pipeline"] = True
             return res
@@ -380,11 +383,14 @@ class PipelineActionsMixin:
         out_dir = self.project.exports_dir / f"paths_{np.random.randint(1e9):09d}"
         layout = prepared.layout
         mosaics = prepared.all_mosaics()
+        from desktop_app.gui.camera_sim_dialog import active_camera_sim
+
+        camera_sim = active_camera_sim()
 
         def job(progress, frame):
             res = render_path_videos(
                 mosaics, layout, spec["keys"], out_dir, lights=spec["lights"], all_sources=spec["all_sources"],
-                fps=spec["fps"], name=spec["name"], progress_cb=progress, frame_cb=frame,
+                fps=spec["fps"], name=spec["name"], camera_sim=camera_sim, progress_cb=progress, frame_cb=frame,
             )
             res["run_pipeline"] = False
             return res

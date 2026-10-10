@@ -126,6 +126,12 @@ class DesktopMainWindow(
         cfg = edit_stabilizer_settings(self)
         self.log(f"Detection {describe_stabilizer(cfg)} (applies to Live Test + next package)", "head")
 
+    def edit_camera_simulation(self) -> None:
+        from desktop_app.gui.camera_sim_dialog import edit_camera_sim
+
+        sim = edit_camera_sim(self)
+        self.log(f"{sim.describe()} (applies to newly generated videos)", "head")
+
     def _tb_action(
         self,
         text: str,
@@ -361,6 +367,12 @@ class DesktopMainWindow(
             self._tb_action(
                 "Detection Filters… / فیلتر تشخیص اشتباه", "settings", self.edit_detection_filters,
                 tip="False-target filters for Live Test and the Jetson package",
+            )
+        )
+        tools_menu.addAction(
+            self._tb_action(
+                "Camera Simulation… / شبیه‌سازی دوربین", "settings", self.edit_camera_simulation,
+                tip="Tilt, real sensor + lens look and altitude range for generated training videos",
             )
         )
         tools_menu.addAction(

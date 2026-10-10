@@ -142,11 +142,17 @@ class AtlasActionsMixin:
             return
         self.log(f"Fine-tune sub-region '{r['project_name']}' from atlas '{atlas.name}'", "head")
 
+        from desktop_app.gui.camera_sim_dialog import active_camera_sim
+
+        camera_sim = active_camera_sim()
+        if camera_sim:
+            self.log(camera_sim.describe())
+
         def job(progress, _frame):
             return prepare_subregion_project(
                 atlas, r["target_lonlat"], r["project_dir"], project_name=r["project_name"],
                 n_videos=r["n_videos"], zoom_out_factor=r["zoom_out_factor"], freeze=r["freeze"],
-                night_fraction=r["night_fraction"], ir_fraction=r["ir_fraction"],
+                night_fraction=r["night_fraction"], ir_fraction=r["ir_fraction"], camera_sim=camera_sim,
                 progress_cb=progress, should_stop=lambda: self._atlas_stop,
             )
 
