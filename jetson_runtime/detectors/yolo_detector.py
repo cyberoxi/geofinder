@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from pathlib import Path
@@ -20,6 +21,29 @@ logger = get_logger("grt.yolo")
 # can replace onnxruntime with onnxruntime-gpu built for another CUDA, after which every
 # inference fails and nothing is detected. Missing packages must be installed by setup instead.
 os.environ.setdefault("YOLO_AUTOINSTALL", "False")
+
+
+class _DropHalfDeprecation(logging.Filter):
+    """Ultralytics logs a half→quantize WARNING on every predict; that stderr flood kills FPS."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("half" in msg and "deprecated" in msg)
+
+
+def _silence_half_deprecation() -> None:
+    filt = _DropHalfDeprecation()
+    for name in ("ultralytics", "ultralytics.yolo"):
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _DropHalfDeprecation) for f in lg.filters):
+            lg.addFilter(filt)
+    try:
+        from ultralytics.utils import LOGGER as ultra_log
+
+        if not any(isinstance(f, _DropHalfDeprecation) for f in ultra_log.filters):
+            ultra_log.addFilter(filt)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class YOLODetector:
@@ -157,6 +181,7 @@ class YOLODetector:
                 self.device,
                 self.load_ms,
             )
+            _silence_half_deprecation()
             self.warmup()
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to load YOLO model %s: %s", path, exc)

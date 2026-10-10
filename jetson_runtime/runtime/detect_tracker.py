@@ -31,9 +31,10 @@ class DetectionTracker:
         tcfg = config.get("tracking", {})
         self.yolo = yolo
         # Not the legacy ``yolo_every_n_frames`` (30): old packages must also detect every frame
-        self.detect_every_n = max(1, int(tcfg.get("detect_every_n", 1)))
+        # Default 2: optical flow bridges odd frames while locked (≈2× FPS on Orin).
+        self.detect_every_n = max(1, int(tcfg.get("detect_every_n", 2)))
         self.adaptive_skip = bool(tcfg.get("adaptive_skip", True))
-        self.target_fps = float(tcfg.get("target_fps", 15.0))
+        self.target_fps = float(tcfg.get("target_fps", 20.0))
         self.skip_frames = 0
         self.stabilizer = TargetStabilizer(config.get("stabilizer"))
         self.optical_flow = OpticalFlowTracker()
@@ -127,7 +128,12 @@ class DetectionTracker:
             self.state.trail = []
         if self.adaptive_skip and self.state.inference_ms > 0:
             est_fps = 1000.0 / max(self.state.inference_ms, 1)
-            self.skip_frames = 1 if est_fps < self.target_fps * 0.5 else 0
+            if est_fps < self.target_fps * 0.4:
+                self.skip_frames = 2
+            elif est_fps < self.target_fps * 0.7:
+                self.skip_frames = 1
+            else:
+                self.skip_frames = 0
         return self.state
 
     def to_frame_result(self, frame_id: int, timestamp: float, process_fps: float = 0.0) -> FrameResult:

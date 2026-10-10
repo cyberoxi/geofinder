@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Set
 
@@ -75,9 +76,30 @@ class ProcessWorker(QThread):
         self.serial_cfg = serial_cfg
         self.min_conf_cb = min_conf_cb
         self._stop = False
+        self._last_ui = 0.0
+        self._last_progress = 0.0
 
     def request_stop(self):
         self._stop = True
+
+    def _emit_frame(self, fr, info: dict) -> None:
+        # Cap preview refresh so Qt paint/scale does not starve the detect thread.
+        now = time.perf_counter()
+        if now - self._last_ui < 1.0 / 18.0:
+            return
+        self._last_ui = now
+        h, w = fr.shape[:2]
+        max_w = 1280
+        if w > max_w:
+            fr = cv2.resize(fr, (max_w, int(h * max_w / w)), interpolation=cv2.INTER_AREA)
+        self.frame_updated.emit(fr, info)
+
+    def _emit_progress(self, c: int, t: int, info: dict) -> None:
+        now = time.perf_counter()
+        if now - self._last_progress < 0.2 and c < t:
+            return
+        self._last_progress = now
+        self.progress.emit(c, t, info)
 
     def run(self):
         try:
@@ -85,8 +107,8 @@ class ProcessWorker(QThread):
                 self.package,
                 source=self.source_spec,
                 prefer_gstreamer=False,
-                progress_cb=lambda c, t, info: self.progress.emit(c, t, info),
-                frame_cb=lambda fr, info: self.frame_updated.emit(fr, info),
+                progress_cb=self._emit_progress,
+                frame_cb=self._emit_frame,
                 stop_flag=lambda: self._stop,
                 serial_override=self.serial_cfg,
                 min_conf=self.min_conf_cb() if self.min_conf_cb else None,
@@ -451,8 +473,10 @@ class JetsonMainWindow(QMainWindow):
     def _show(self, frame_bgr, info=None):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.view.setPixmap(QPixmap.fromImage(qimg.copy()).scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        # FastTransformation: SmoothTransformation was a large per-frame cost on Jetson
+        self.view.setPixmap(pix.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
         if info:
             self.status.setText(str(info.get("status", "")))
             color = {"TRACKING": "limegreen", "LOST": "red", "RE_DETECTING": "gold", "SEARCHING": "orange", "SCALE_CHANGE": "deepskyblue"}.get(

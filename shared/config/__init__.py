@@ -54,7 +54,9 @@ DEFAULT_RUNTIME = {
         "low_confidence_threshold": 0.30,
         "min_iou": 0.20,
         "adaptive_skip": True,
-        "target_fps": 15.0,
+        "target_fps": 20.0,
+        # Jetson DetectionTracker: run YOLO every N frames; optical flow bridges the rest
+        "detect_every_n": 2,
     },
     "yolo": {
         "mode": "segmentation",

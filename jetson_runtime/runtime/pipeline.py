@@ -173,7 +173,14 @@ def run_runtime(
     out_dir.mkdir(parents=True, exist_ok=True)
     failed_dir = out_dir / "failed_frames"
     exporter = ResultExporter(str(out_dir), str(failed_dir), loader.runtime_config)
-    if loader.runtime_config.get("export", {}).get("save_annotated_video", True):
+    export_cfg = loader.runtime_config.get("export", {})
+    # Software mp4 encode every frame is a major FPS tax on Jetson; skip for live
+    # camera and GUI preview runs (CLI file batch still writes annotated video).
+    save_video = bool(export_cfg.get("save_annotated_video", True))
+    if save_video and (frame_source.is_live or frame_cb is not None):
+        logger.info("Annotated video export disabled for live/GUI run (keeps FPS high)")
+        save_video = False
+    if save_video:
         exporter.start_video(
             None, frame_source.info.width, frame_source.info.height, frame_source.info.fps
         )
@@ -221,6 +228,8 @@ def run_runtime(
     fps_list = []
     t0 = time.perf_counter()
     idx = 0
+    last_ui = 0.0
+    ui_interval = 1.0 / 18.0  # match GUI preview cap; skip overlay work between refreshes
     if end_frame >= 0:
         last = end_frame
     elif frame_source.is_live or frame_source.info.frame_count <= 0:
@@ -274,35 +283,38 @@ def run_runtime(
                 info["min_conf"] = yolo.confidence_threshold
             serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
 
-            if isinstance(tracker, DetectionTracker):
-                # Same overlay as the desktop Live Test: target / aux objects / rejected / confirming,
-                # centre cross, arrow to the target (frame edge when off-screen), centre distance
-                annotated = draw_localization(frame, tracker.dets, tracker.loc, yolo.class_names)
-                _draw_footer(annotated, result)
-            else:
-                annotated = draw_overlay(frame, result, trail=state.trail)
-            exporter.write_frame(annotated)
-            if state.status == RuntimeState.LOST and loader.runtime_config.get("export", {}).get("save_failed_frames", True):
+            now = time.perf_counter()
+            want_ui = frame_cb is not None and (now - last_ui) >= ui_interval
+            if save_video or want_ui:
+                if isinstance(tracker, DetectionTracker):
+                    # Same overlay as the desktop Live Test: target / aux objects / rejected /
+                    # confirming, centre cross, arrow to the target, centre distance
+                    annotated = draw_localization(frame, tracker.dets, tracker.loc, yolo.class_names)
+                    _draw_footer(annotated, result)
+                else:
+                    annotated = draw_overlay(frame, result, trail=state.trail)
+                if save_video:
+                    exporter.write_frame(annotated)
+                if want_ui:
+                    last_ui = now
+                    frame_cb(annotated, info)
+            if state.status == RuntimeState.LOST and export_cfg.get("save_failed_frames", True):
                 exporter.save_failed_frame(frame, idx)
             processed += 1
             if progress_cb:
                 progress_cb(processed, progress_total or processed, info)
-            if frame_cb:
-                frame_cb(annotated, info)
 
             step = 1 + max(0, int(getattr(tracker, "skip_frames", 0)))
             next_idx = idx + step
             if next_idx > last:
                 break
-            if frame_source.is_live:
-                # Drop intermediate frames when skip_frames > 0
-                ok, frame = False, None
-                for _ in range(step):
-                    ok, frame = frame_source.read()
-                    if not ok or frame is None:
-                        break
-            else:
-                ok, frame = frame_source.seek(next_idx)
+            # Always advance with sequential read — CAP_PROP seek-per-frame is very
+            # slow on Jetson OpenCV backends and was the main file-run FPS bottleneck.
+            ok, frame = False, None
+            for _ in range(step):
+                ok, frame = frame_source.read()
+                if not ok or frame is None:
+                    break
             idx = next_idx
             if not ok or frame is None:
                 break
