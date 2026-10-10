@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from shared.package_utils import validate_package
-from shared.config import default_runtime_config, load_yaml
+from shared.config import deep_update, default_runtime_config, load_yaml
 from shared.logging import get_logger
 from shared.schemas import Manifest
 
@@ -39,7 +39,8 @@ class PackageLoader:
         self.manifest = Manifest.from_dict(json.loads((self.root / "manifest.json").read_text(encoding="utf-8")))
         cfg_path = self.root / "config" / "runtime.yaml"
         if cfg_path.exists():
-            self.runtime_config = load_yaml(cfg_path)
+            # Merge so new defaults (e.g. detect_every_n) apply to older packages
+            self.runtime_config = deep_update(default_runtime_config(), load_yaml(cfg_path))
         logger.info("Loaded package %s format=%s", self.manifest.project_name, self.manifest.model_format)
         return self.root
 

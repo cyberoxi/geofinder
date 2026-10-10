@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from shared.video_reader import VideoInfo, VideoReader
@@ -13,6 +14,35 @@ KIND_IMX477 = "imx477"
 KIND_USB = "usb"
 
 VALID_KINDS = (KIND_FILE, KIND_IMX477, KIND_USB)
+
+
+def describe_csi_hardware() -> str:
+    """Short CSI/Argus status for the input dialog and open errors."""
+    from shared.video_reader import jetson_argus_available, jetson_gpu_power_hint
+
+    videos = sorted(p.name for p in Path("/dev").glob("video*"))
+    sensors: list[str] = []
+    root = Path("/proc/device-tree")
+    if root.is_dir():
+        for tag in ("imx219", "imx477", "imx708", "ov5693"):
+            sensors.extend(p.name for p in root.rglob(f"*{tag}*"))
+    sensors = list(dict.fromkeys(sensors))
+    if not jetson_argus_available():
+        return jetson_gpu_power_hint()
+    if sensors and videos:
+        shown = ", ".join(sensors[:4])
+        nodes = ", ".join(f"/dev/{n}" for n in videos[:4])
+        return f"CSI OK: {shown}; {nodes}"
+    if sensors and not videos:
+        return (
+            "Sensor in device tree but no /dev/video*. Restart nvargus-daemon, "
+            "or check the CSI ribbon (contacts toward the board)."
+        )
+    return (
+        "Argus: no CSI camera (no overlay, no /dev/video*). "
+        "On Orin Nano run: sudo /opt/nvidia/jetson-io/jetson-io.py → "
+        "Configure 24pin CSI → IMX219 or IMX477 (CAM0=A, CAM1=C) → Save and reboot."
+    )
 
 
 @dataclass
@@ -64,7 +94,8 @@ class InputSourceSpec:
             usb_index=int(data.get("usb_index", data.get("camera_index", 0))),
             width=int(data.get("width", 1920 if kind == KIND_IMX477 else 1280)),
             height=int(data.get("height", 1080 if kind == KIND_IMX477 else 720)),
-            fps=int(data.get("fps", 30)),
+            # IMX477 1080p Argus mode is 60 fps (30 selects the same mode awkwardly).
+            fps=int(data.get("fps", 60 if kind == KIND_IMX477 else 30)),
             flip_method=int(data.get("flip_method", 0)),
             prefer_gstreamer=bool(data.get("prefer_gstreamer", False)),
         )
@@ -98,8 +129,12 @@ class FrameSource:
         self.reader.release()
 
 
-def open_input_source(spec: InputSourceSpec) -> FrameSource:
-    """Open file / IMX477 CSI / USB webcam according to *spec*."""
+def open_input_source(spec: InputSourceSpec, *, require_scene: bool = False) -> FrameSource:
+    """Open file / IMX477 CSI / USB webcam according to *spec*.
+
+    ``require_scene`` (IMX477 only): when True, refuse blank/purple-fog frames.
+    Default False so Camera Test / Import Source / Run can open the same feed.
+    """
     kind = spec.kind
     if kind == KIND_FILE:
         if not spec.path:
@@ -108,13 +143,17 @@ def open_input_source(spec: InputSourceSpec) -> FrameSource:
         return FrameSource(reader=reader, is_live=False, label=spec.label())
 
     if kind == KIND_IMX477:
-        reader = VideoReader.from_imx477(
-            sensor_id=spec.sensor_id,
-            width=spec.width,
-            height=spec.height,
-            fps=spec.fps,
-            flip_method=spec.flip_method,
-        )
+        try:
+            reader = VideoReader.from_imx477(
+                sensor_id=spec.sensor_id,
+                width=spec.width,
+                height=spec.height,
+                fps=spec.fps,
+                flip_method=spec.flip_method,
+                require_scene=require_scene,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc}\n{describe_csi_hardware()}") from exc
         return FrameSource(reader=reader, is_live=True, label=spec.label())
 
     if kind == KIND_USB:

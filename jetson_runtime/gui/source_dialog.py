@@ -10,6 +10,7 @@ from jetson_runtime.runtime.sources import (
     KIND_IMX477,
     KIND_USB,
     InputSourceSpec,
+    describe_csi_hardware,
 )
 from shared.qt_compat import (
     QComboBox,
@@ -93,6 +94,11 @@ class InputSourceDialog(QDialog):
         self.flip.setToolTip("nvvidconv flip-method (0 = none)")
         form.addRow("Flip method (CSI):", self.flip)
 
+        self.csi_status = QLabel(describe_csi_hardware())
+        self.csi_status.setWordWrap(True)
+        self.csi_status.setStyleSheet("color:#fbbf24;")
+        form.addRow("CSI status:", self.csi_status)
+
         root.addLayout(form)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -130,6 +136,7 @@ class InputSourceDialog(QDialog):
         if is_csi and self.width.value() < 640:
             self.width.setValue(1920)
             self.height.setValue(1080)
+            self.fps.setValue(60)
         if is_usb and self.width.value() > 1920 and self._initial.kind != KIND_USB:
             self.width.setValue(1280)
             self.height.setValue(720)

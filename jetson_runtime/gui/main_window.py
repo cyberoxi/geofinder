@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Set
 
@@ -52,6 +53,7 @@ from jetson_runtime.gui.camera_test_dialog import open_camera_test
 from jetson_runtime.gui.confidence_control import ConfidenceControl
 from jetson_runtime.gui.serial_dialog import edit_serial_settings, load_serial_settings
 from jetson_runtime.gui.source_dialog import choose_input_source
+from jetson_runtime.gui.stabilizer_control import StabilizerFilterBar, describe_stabilizer
 from jetson_runtime.runtime.pipeline import run_runtime
 from jetson_runtime.runtime.sources import KIND_FILE, InputSourceSpec, open_input_source
 
@@ -68,16 +70,41 @@ class ProcessWorker(QThread):
         source_spec: InputSourceSpec,
         serial_cfg: Optional[dict] = None,
         min_conf_cb=None,
+        stabilizer_cb=None,
+        stabilizer_cfg: Optional[dict] = None,
     ):
         super().__init__()
         self.package = package
         self.source_spec = source_spec
         self.serial_cfg = serial_cfg
         self.min_conf_cb = min_conf_cb
+        self.stabilizer_cb = stabilizer_cb
+        self.stabilizer_cfg = stabilizer_cfg
         self._stop = False
+        self._last_ui = 0.0
+        self._last_progress = 0.0
 
     def request_stop(self):
         self._stop = True
+
+    def _emit_frame(self, fr, info: dict) -> None:
+        # Cap preview refresh so Qt paint/scale does not starve the detect thread.
+        now = time.perf_counter()
+        if now - self._last_ui < 1.0 / 12.0:
+            return
+        self._last_ui = now
+        h, w = fr.shape[:2]
+        max_w = 960
+        if w > max_w:
+            fr = cv2.resize(fr, (max_w, int(h * max_w / w)), interpolation=cv2.INTER_AREA)
+        self.frame_updated.emit(fr, info)
+
+    def _emit_progress(self, c: int, t: int, info: dict) -> None:
+        now = time.perf_counter()
+        if now - self._last_progress < 0.2 and c < t:
+            return
+        self._last_progress = now
+        self.progress.emit(c, t, info)
 
     def run(self):
         try:
@@ -85,12 +112,14 @@ class ProcessWorker(QThread):
                 self.package,
                 source=self.source_spec,
                 prefer_gstreamer=False,
-                progress_cb=lambda c, t, info: self.progress.emit(c, t, info),
-                frame_cb=lambda fr, info: self.frame_updated.emit(fr, info),
+                progress_cb=self._emit_progress,
+                frame_cb=self._emit_frame,
                 stop_flag=lambda: self._stop,
                 serial_override=self.serial_cfg,
                 min_conf=self.min_conf_cb() if self.min_conf_cb else None,
                 min_conf_cb=self.min_conf_cb,
+                stabilizer_override=self.stabilizer_cfg,
+                stabilizer_cb=self.stabilizer_cb,
             )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001
@@ -236,6 +265,11 @@ class JetsonMainWindow(QMainWindow):
         self.conf = ConfidenceControl()
         layout.addWidget(self.conf)
 
+        # Same three false-target filters as desktop Live Test (toggle while running)
+        self.filters = StabilizerFilterBar()
+        self.filters.set_change_callback(self._on_filters_changed)
+        layout.addWidget(self.filters)
+
         tl = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self._seek)
@@ -351,16 +385,21 @@ class JetsonMainWindow(QMainWindow):
     def _set_package(self, path: str, *, from_usb: bool = False, source: Optional[Path] = None) -> None:
         self.package_path = path
         self.conf.set_package(path)
+        self.filters.reload_from_package(path)
         note = ""
         if from_usb and source is not None:
             note = f"\nImported from USB:\n{source}\nStatus: transferred"
         self._refresh_info_panel(package_note=note)
         self.statusBar().showMessage(
-            f"{'USB transfer OK' if from_usb else 'Package selected'}: {path}"
+            f"{'USB transfer OK' if from_usb else 'Package selected'}: {path} · "
+            f"{describe_stabilizer(self.filters.config())}"
         )
         if from_usb:
             self.status.setText("USB IMPORTED")
             self.status.setStyleSheet("font-size:18px;font-weight:bold;color:#22c55e;")
+
+    def _on_filters_changed(self, cfg: dict) -> None:
+        self.statusBar().showMessage(describe_stabilizer(cfg))
 
     def import_package(self):
         path, _ = QFileDialog.getOpenFileName(self, "Deployment package", "", "ZIP (*.zip);;All (*)")
@@ -418,7 +457,9 @@ class JetsonMainWindow(QMainWindow):
                 self.input_spec = spec
                 self._seek(0)
             else:
-                src = open_input_source(spec)
+                # Same as Camera Test: show the feed even if AE/focus looks soft.
+                # Blank-scene hard-fail is only a warning here so Import Source can preview.
+                src = open_input_source(spec, require_scene=False)
                 try:
                     ok, frame = src.read()
                     if not ok or frame is None:
@@ -429,6 +470,22 @@ class JetsonMainWindow(QMainWindow):
                     self.frame_spin.setRange(0, 0)
                     self.input_spec = spec
                     self._show(frame)
+                    from shared.video_reader import frame_lacks_scene
+
+                    if frame_lacks_scene(frame):
+                        self.statusBar().showMessage(
+                            f"Input ready: {spec.label()} — warning: blank/fog preview"
+                        )
+                        QMessageBox.warning(
+                            self,
+                            "Camera preview",
+                            "Camera opened but the preview looks blank / purple fog.\n"
+                            "تصویر باز شد ولی خالی یا مه بنفش به نظر می‌رسد.\n\n"
+                            "Check lens cap, focus ring, and lighting. "
+                            "Detection needs a real scene (same as Camera Test).",
+                        )
+                        self._refresh_info_panel()
+                        return
                 finally:
                     src.release()
         except Exception as exc:  # noqa: BLE001
@@ -451,8 +508,10 @@ class JetsonMainWindow(QMainWindow):
     def _show(self, frame_bgr, info=None):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        self.view.setPixmap(QPixmap.fromImage(qimg.copy()).scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        pix = QPixmap.fromImage(qimg)
+        # FastTransformation: SmoothTransformation was a large per-frame cost on Jetson
+        self.view.setPixmap(pix.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
         if info:
             self.status.setText(str(info.get("status", "")))
             color = {"TRACKING": "limegreen", "LOST": "red", "RE_DETECTING": "gold", "SEARCHING": "orange", "SCALE_CHANGE": "deepskyblue"}.get(
@@ -475,7 +534,12 @@ class JetsonMainWindow(QMainWindow):
             self.reader = None
         serial_cfg = load_serial_settings()
         self.worker = ProcessWorker(
-            self.package_path, self.input_spec, serial_cfg=serial_cfg, min_conf_cb=self.conf.fraction
+            self.package_path,
+            self.input_spec,
+            serial_cfg=serial_cfg,
+            min_conf_cb=self.conf.fraction,
+            stabilizer_cfg=self.filters.config(),
+            stabilizer_cb=self.filters.config,
         )
         self.worker.frame_updated.connect(lambda fr, info: self._show(fr, info))
         self.worker.progress.connect(self._on_progress)

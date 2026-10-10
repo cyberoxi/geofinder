@@ -12,6 +12,7 @@ from jetson_runtime.runtime.sources import (
     InputSourceSpec,
     open_input_source,
 )
+from shared.video_reader import frame_lacks_scene
 from shared.qt_compat import (
     QComboBox,
     QDialog,
@@ -25,14 +26,46 @@ from shared.qt_compat import (
     QPushButton,
     QSpinBox,
     Qt,
+    QThread,
     QTimer,
     QVBoxLayout,
+    Signal,
     qt_exec,
 )
 
 
+class _OpenCameraWorker(QThread):
+    """Open camera off the UI thread so Argus/GStreamer cannot freeze the dialog."""
+
+    finished_ok = Signal(object, object)  # FrameSource, first BGR frame
+    finished_err = Signal(str)
+
+    def __init__(self, spec: InputSourceSpec, parent=None):
+        super().__init__(parent)
+        self._spec = spec
+
+    def run(self) -> None:
+        source = None
+        try:
+            # Allow blank frames here so the user can see purple fog / lens issues.
+            source = open_input_source(self._spec, require_scene=False)
+            ok, frame = source.read()
+            if not ok or frame is None:
+                raise RuntimeError(f"No frame from {self._spec.label()}")
+            self.finished_ok.emit(source, frame)
+        except Exception as exc:  # noqa: BLE001
+            if source is not None:
+                try:
+                    source.release()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.finished_err.emit(str(exc))
+
+
 class CameraTestDialog(QDialog):
     """Open CSI/USB camera and show a live preview to verify the feed."""
+
+    _OPEN_TIMEOUT_MS = 12000
 
     def __init__(self, parent=None, initial: Optional[InputSourceSpec] = None):
         super().__init__(parent)
@@ -42,9 +75,14 @@ class CameraTestDialog(QDialog):
         self._frame_count = 0
         self._chosen: Optional[InputSourceSpec] = None
         self._initial = initial
+        self._worker: Optional[_OpenCameraWorker] = None
+        self._open_spec: Optional[InputSourceSpec] = None
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
+        self._open_watchdog = QTimer(self)
+        self._open_watchdog.setSingleShot(True)
+        self._open_watchdog.timeout.connect(self._on_open_timeout)
         self._build()
         self._apply_initial()
         self._on_kind_changed()
@@ -53,7 +91,10 @@ class CameraTestDialog(QDialog):
         root = QVBoxLayout(self)
         tip = QLabel(
             "Start the camera to verify the live image (no detection).\n"
-            "دوربین را روشن کنید و تصویر زنده را ببینید — بدون تشخیص هدف."
+            "دوربین را روشن کنید و تصویر زنده را ببینید — بدون تشخیص هدف.\n"
+            "You must see a real scene before Run. Purple/gray fog or a flat "
+            "field means lens cap / focus / no light — detection will never lock.\n"
+            "صفحه بنفش/خاکستری = درپوش لنز، فوکوس، یا نور کم (مدل مقصر نیست)."
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#94a3b8;")
@@ -68,7 +109,7 @@ class CameraTestDialog(QDialog):
 
         self.sensor_id = QSpinBox()
         self.sensor_id.setRange(0, 3)
-        self.sensor_id.setToolTip("nvarguscamerasrc sensor-id (usually 0)")
+        self.sensor_id.setToolTip("CSI sensor-id / /dev/videoN (usually 0)")
         form.addRow("CSI sensor-id:", self.sensor_id)
 
         self.usb_index = QSpinBox()
@@ -93,7 +134,7 @@ class CameraTestDialog(QDialog):
 
         self.flip = QSpinBox()
         self.flip.setRange(0, 7)
-        self.flip.setToolTip("nvvidconv flip-method (0 = none)")
+        self.flip.setToolTip("nvvidconv flip-method (0 = none; Argus only)")
         form.addRow("Flip method (CSI):", self.flip)
         root.addLayout(form)
 
@@ -146,13 +187,15 @@ class CameraTestDialog(QDialog):
 
     def _on_kind_changed(self) -> None:
         kind = self.kind.currentData()
+        busy = self._timer.isActive() or (self._worker is not None and self._worker.isRunning())
         is_csi = kind == KIND_IMX477
-        self.sensor_id.setEnabled(is_csi and not self._timer.isActive())
-        self.usb_index.setEnabled(not is_csi and not self._timer.isActive())
-        self.flip.setEnabled(is_csi and not self._timer.isActive())
+        self.sensor_id.setEnabled(is_csi and not busy)
+        self.usb_index.setEnabled(not is_csi and not busy)
+        self.flip.setEnabled(is_csi and not busy)
         if is_csi and self.width.value() < 640:
             self.width.setValue(1920)
             self.height.setValue(1080)
+            self.fps.setValue(60)
         if not is_csi and self.width.value() > 1920:
             self.width.setValue(1280)
             self.height.setValue(720)
@@ -180,30 +223,99 @@ class CameraTestDialog(QDialog):
     def _start(self) -> None:
         self._stop()
         spec = self._spec()
-        try:
-            self._source = open_input_source(spec)
-            ok, frame = self._source.read()
-            if not ok or frame is None:
-                raise RuntimeError(f"No frame from {spec.label()}")
-        except Exception as exc:  # noqa: BLE001
-            self._release_source()
-            QMessageBox.critical(self, "Camera", str(exc))
-            self.status.setText(f"Failed: {exc}")
-            return
-        self._frame_count = 0
-        self._show_frame(frame)
-        self._timer.start()
+        self._open_spec = spec
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self._set_controls_enabled(False)
-        self.status.setText(f"Live: {spec.label()}")
+        self.status.setText(f"Opening {spec.label()}…")
+        self.view.setText("Opening camera…")
 
-    def _stop(self) -> None:
-        self._timer.stop()
+        worker = _OpenCameraWorker(spec, self)
+        worker.finished_ok.connect(self._on_open_ok)
+        worker.finished_err.connect(self._on_open_err)
+        self._worker = worker
+        self._open_watchdog.start(self._OPEN_TIMEOUT_MS)
+        worker.start()
+
+    def _on_open_ok(self, source, frame) -> None:
+        self._open_watchdog.stop()
+        self._worker = None
+        self._source = source
+        self._frame_count = 0
+        self._show_frame(frame)
+        self._timer.start()
+        label = self._open_spec.label() if self._open_spec else "camera"
+        backend = ""
+        try:
+            backend = getattr(source.reader, "backend", "") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        suffix = f" [{backend}]" if backend else ""
+        if frame_lacks_scene(frame):
+            self.status.setText(
+                f"Live: {label}{suffix} — WARNING: blank/fog frame (no scene)"
+            )
+            self.status.setStyleSheet("color:#fbbf24;")
+        else:
+            self.status.setStyleSheet("")
+            self.status.setText(f"Live: {label}{suffix}")
+
+    def _on_open_err(self, message: str) -> None:
+        self._open_watchdog.stop()
+        self._worker = None
         self._release_source()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._set_controls_enabled(True)
+        self.view.setText("Camera off / دوربین خاموش")
+        self.status.setText(f"Failed: {message}")
+        QMessageBox.critical(self, "Camera", message)
+
+    def _on_open_timeout(self) -> None:
+        worker = self._worker
+        if worker is None or not worker.isRunning():
+            return
+        self.status.setText("Open timed out — stopping…")
+        # Cannot safely kill OpenCV mid-open; detach and reset UI.
+        try:
+            worker.finished_ok.disconnect(self._on_open_ok)
+            worker.finished_err.disconnect(self._on_open_err)
+        except Exception:  # noqa: BLE001
+            pass
+        worker.setParent(None)
+        self._worker = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._set_controls_enabled(True)
+        self.view.setText("Camera off / دوربین خاموش")
+        msg = (
+            "Camera open timed out (often broken Argus/GPU).\n"
+            "App will skip Argus when nvidia-smi has no device and use V4L2.\n"
+            "Restart the app and try again, or reboot if GPU stays down."
+        )
+        self.status.setText("Open timed out")
+        QMessageBox.warning(self, "Camera", msg)
+
+    def _stop(self) -> None:
+        self._open_watchdog.stop()
+        self._timer.stop()
+        worker = self._worker
+        if worker is not None:
+            try:
+                worker.finished_ok.disconnect(self._on_open_ok)
+                worker.finished_err.disconnect(self._on_open_err)
+            except Exception:  # noqa: BLE001
+                pass
+            if worker.isRunning():
+                worker.setParent(None)
+            else:
+                worker.deleteLater()
+            self._worker = None
+        self._release_source()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._set_controls_enabled(True)
+        self.view.setText("Camera off / دوربین خاموش")
         if self._frame_count:
             self.status.setText(f"Stopped — {self._frame_count} frame(s)")
         else:
@@ -230,6 +342,16 @@ class CameraTestDialog(QDialog):
 
     def _show_frame(self, frame_bgr) -> None:
         self._frame_count += 1
+        # Downscale huge CSI V4L2 frames before Qt convert (e.g. 3840x2160).
+        h0, w0 = frame_bgr.shape[:2]
+        max_w = max(640, self.view.width())
+        if w0 > max_w:
+            scale = max_w / float(w0)
+            frame_bgr = cv2.resize(
+                frame_bgr,
+                (int(w0 * scale), int(h0 * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -238,7 +360,7 @@ class CameraTestDialog(QDialog):
         )
         self.view.setPixmap(pix)
         if self._frame_count % 15 == 0:
-            self.status.setText(f"Live {w}x{h} — frame {self._frame_count}")
+            self.status.setText(f"Live {w0}x{h0} — frame {self._frame_count}")
 
     def _use_as_input(self) -> None:
         self._chosen = self._spec()

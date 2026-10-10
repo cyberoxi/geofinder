@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,111 @@ import numpy as np
 from shared.logging import get_logger
 
 logger = get_logger("shared.video")
+
+
+def jetson_argus_available() -> bool:
+    """True when NVIDIA GPU/CUDA is usable (Argus/NVMM pipelines need this)."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        return False
+    if "No devices" in out or "couldn't communicate" in out:
+        return False
+    return bool(proc.stdout.strip())
+
+
+def jetson_gpu_power_hint() -> str:
+    """Short hint when CSI needs GPU but nvidia-smi has no device."""
+    powered = Path("/sys/devices/platform/bus@0/17000000.gpu/gpu_powered_on")
+    rail = Path("/sys/devices/platform/bus@0/17000000.gpu/is_railgated")
+    bits: list[str] = []
+    try:
+        if powered.is_file() and powered.read_text().strip() == "off":
+            bits.append("GPU powered off")
+        if rail.is_file() and rail.read_text().strip() == "yes":
+            bits.append("railgated")
+    except OSError:
+        pass
+    detail = f" ({', '.join(bits)})" if bits else ""
+    return (
+        f"Jetson GPU/CUDA unavailable{detail} — IMX477 needs Argus/ISP "
+        "(not raw V4L2). Fix: sudo sh -c 'echo on > "
+        "/sys/devices/platform/bus@0/17000000.gpu/power/control' "
+        "then ensure /etc/ld.so.conf.d/000-nvidia-gpu-libs.conf points to "
+        "openrm (not nvgpu), sudo ldconfig, reboot. Check: nvidia-smi -L"
+    )
+
+
+def _frame_is_solid_green(frame: np.ndarray) -> bool:
+    """True for classic broken CSI preview (solid / near-solid green)."""
+    if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
+        return False
+    # Sample to keep this cheap on 4K frames.
+    sample = frame[::16, ::16]
+    b, g, r = sample[:, :, 0], sample[:, :, 1], sample[:, :, 2]
+    if float(g.std()) > 8.0:
+        return False
+    return float(g.mean()) > 40.0 and float(b.mean()) < 15.0 and float(r.mean()) < 15.0
+
+
+def frame_lacks_scene(frame: np.ndarray) -> bool:
+    """True when the frame is green/blank/noise-only (no usable scene for YOLO).
+
+    IMX477 sometimes streams a purple/gray fog with sensor grain when the lens
+    is capped, completely defocused, or getting almost no light. Argus is up,
+    so open succeeds, but detection always stays searching.
+    """
+    if frame is None or frame.ndim < 2:
+        return True
+    if _frame_is_solid_green(frame):
+        return True
+    if frame.ndim == 2:
+        gray = frame
+    else:
+        gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
+    # Downscale so Canny cost stays tiny on 4K.
+    h, w = gray.shape[:2]
+    if max(h, w) > 480:
+        scale = 480.0 / float(max(h, w))
+        gray = cv2.resize(
+            gray,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    std = float(gray.std())
+    if std < 10.0:
+        return True
+    edges = cv2.Canny(gray, 30, 100)
+    # Real scenes (even a desk) have thousands of edge pixels at 480px; fog has ~0.
+    return int(np.count_nonzero(edges)) < 400
+
+
+def imx477_blank_frame_hint() -> str:
+    return (
+        "IMX477 stream has no scene content (blank / purple fog / noise only). "
+        "YOLO cannot detect anything — this is not a model bug.\n"
+        "تصویر دوربین خالی یا مه بنفش است؛ مدل چیزی برای تشخیص ندارد.\n\n"
+        "Check: remove lens cap / protective film, turn the focus ring, "
+        "point at a lit scene, then use Camera Test — you must see a real "
+        "picture (desk, floor, screen), not a flat purple/gray field."
+    )
+
+
+def _normalize_imx477_mode(width: int, height: int, fps: int) -> Tuple[int, int, int]:
+    """Snap to IMX477 Argus sensor modes: 1080p@60 or 4K@30 only."""
+    w, h = int(width), int(height)
+    if w >= 2560 or h >= 1440:
+        return 3840, 2160, 30
+    return 1920, 1080, 60
 
 
 @dataclass
@@ -56,6 +162,7 @@ def imx477_gstreamer_pipeline(
     flip_method: int = 0,
 ) -> str:
     """Argus CSI pipeline for IMX477 (and similar) on Jetson."""
+    width, height, fps = _normalize_imx477_mode(width, height, fps)
     return (
         f"nvarguscamerasrc sensor-id={int(sensor_id)} ! "
         f"video/x-raw(memory:NVMM), width=(int){int(width)}, height=(int){int(height)}, "
@@ -132,25 +239,56 @@ class VideoReader:
         height: int = 1080,
         fps: int = 30,
         flip_method: int = 0,
+        require_scene: bool = False,
     ) -> "VideoReader":
-        """Open Jetson CSI IMX477 via nvarguscamerasrc."""
+        """Open Jetson CSI IMX477 via Argus (requires working GPU/ISP)."""
         obj = cls._blank_live(f"imx477:{int(sensor_id)}")
+        sid = int(sensor_id)
+        width, height, fps = _normalize_imx477_mode(width, height, fps)
+
+        if not jetson_argus_available():
+            raise RuntimeError(jetson_gpu_power_hint())
+
         pipe = imx477_gstreamer_pipeline(
-            sensor_id=sensor_id,
+            sensor_id=sid,
             width=width,
             height=height,
             fps=fps,
             flip_method=flip_method,
         )
-        if not obj._try_open(pipe, cv2.CAP_GSTREAMER, rewind=False):
-            raise RuntimeError(
-                f"Cannot open IMX477 CSI (sensor-id={sensor_id}). "
-                "Check cable, Jetson CSI connection, and Argus / nvargus-daemon."
+        if obj._try_open(pipe, cv2.CAP_GSTREAMER, rewind=False):
+            obj.backend = "imx477-argus"
+            # AE/AWB need a short warm-up; first frames are often purple fog.
+            last = obj._warmup_live(n=25)
+            obj._finish_live_info(width=width, height=height, fps=float(fps))
+            if require_scene and (last is None or frame_lacks_scene(last)):
+                obj.release()
+                raise RuntimeError(imx477_blank_frame_hint())
+            logger.info(
+                "Opened IMX477 CSI sensor-id=%s %sx%s@%s (Argus)",
+                sid,
+                width,
+                height,
+                fps,
             )
-        obj.backend = "imx477-argus"
-        obj._finish_live_info(width=width, height=height, fps=float(fps))
-        logger.info("Opened IMX477 CSI sensor-id=%s %sx%s@%s", sensor_id, width, height, fps)
-        return obj
+            return obj
+
+        raise RuntimeError(
+            f"Cannot open CSI (sensor-id={sid}, {width}x{height}@{fps}). "
+            "Argus reported no usable camera. Enable the matching IMX overlay "
+            "in Jetson-IO and reboot; also try sensor-id 1 if the ribbon is on CAM1. "
+            "Raw V4L2 is not used for IMX477 (shows a green screen without ISP)."
+        )
+
+    def _warmup_live(self, n: int = 20) -> Optional[np.ndarray]:
+        """Discard early AE frames; return the last good BGR frame (or None)."""
+        last: Optional[np.ndarray] = None
+        for _ in range(max(0, int(n))):
+            ok, frame = self.read()
+            if not ok or frame is None:
+                break
+            last = frame
+        return last
 
     def _try_open(self, source, api=cv2.CAP_ANY, *, rewind: bool = True) -> bool:
         cap = cv2.VideoCapture(source, api)
@@ -160,6 +298,10 @@ class VideoReader:
         ok, frame = cap.read()
         if not ok or frame is None:
             cap.release()
+            return False
+        if _frame_is_solid_green(frame):
+            cap.release()
+            logger.warning("Rejected solid-green camera frame (broken CSI/ISP path)")
             return False
         if rewind:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -188,14 +330,16 @@ class VideoReader:
         if sys.platform == "linux":
             w = width or 1280
             h = height or 720
-            attempts.append(
-                (
-                    "gstreamer-v4l2",
-                    usb_v4l2_gstreamer_pipeline(index, width=w, height=h, fps=fps),
-                    cv2.CAP_GSTREAMER,
-                )
-            )
+            # Prefer plain V4L2 — GStreamer/NV plugins can hang when GPU is down.
             attempts.append(("v4l2", index, getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)))
+            if jetson_argus_available():
+                attempts.append(
+                    (
+                        "gstreamer-v4l2",
+                        usb_v4l2_gstreamer_pipeline(index, width=w, height=h, fps=fps),
+                        cv2.CAP_GSTREAMER,
+                    )
+                )
         if sys.platform == "win32":
             attempts.append(("dshow", index, cv2.CAP_DSHOW))
         attempts.append(("any", index, cv2.CAP_ANY))
