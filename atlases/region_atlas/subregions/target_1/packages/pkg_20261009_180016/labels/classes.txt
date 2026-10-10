@@ -1,0 +1,11 @@
+target_region
+landmark_1_water
+landmark_2_building
+landmark_3_sports_field
+landmark_4_building
+landmark_5_water
+landmark_6_water
+landmark_7_building
+landmark_8_water
+landmark_9_building
+landmark_10_building

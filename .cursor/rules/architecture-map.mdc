@@ -1,0 +1,16 @@
+---
+description: Short module map when editing desktop / satellite / jetson code
+globs: desktop_app/**/*.py,jetson_runtime/**/*.py,shared/**/*.py,gui/**/*.py,core/**/*.py
+alwaysApply: false
+---
+
+# Layout
+
+- `desktop_app/gui/`: UI shells — `main_window`, `pipeline_actions`, `workers`, `satellite_dialog`, `frame_canvas`, `serial_actions` / `serial_dialog`
+- `shared/serial_out.py`: UART dx/dy offset send (desktop live test + Jetson)
+- `desktop_app/satellite/`: `prepare` → `render` / `generate`; tiles in `tiles.py`
+- `desktop_app/pipeline/auto.py`: headless dataset→train→ONNX→package
+- `jetson_runtime/`: package load + detect/track
+- `shared/`: geometry, schemas, video I/O, landmarks
+
+Import satellite features from `desktop_app.satellite` (stable re-exports).

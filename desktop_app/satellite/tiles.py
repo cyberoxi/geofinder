@@ -40,7 +40,9 @@ LAYERS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Additional imagery sources (all usable for mosaics unless "mosaic": "0")
+# High-res training imagery: Esri (free) + optional Mapbox / Azure (API key).
+# Low-res free stacks (GIBS ~250 m, EOX S2 ~10 m) are omitted from mosaic combo —
+# they look soft next to Esri at download zoom 16–19.
 LAYERS.update(
     {
         "esri_clarity": {
@@ -48,13 +50,6 @@ LAYERS.update(
             "attribution": "Esri World Imagery (Clarity)",
             "cache": "esri_clarity",
             "title": "Esri Clarity (sharper processing)",
-        },
-        "sentinel2": {
-            "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2023_3857/default/g/{z}/{y}/{x}.jpg",
-            "attribution": "Sentinel-2 cloudless 2023 by EOX (CC BY-NC-SA 4.0, contains Copernicus data)",
-            "cache": "eox_s2cloudless_2023",
-            "title": "Sentinel-2 cloudless 2023 (10 m, non-commercial)",
-            "max_zoom": "15",
         },
         "night_lights": {
             "url": (
@@ -100,6 +95,45 @@ def register_custom_layer(url_template: str, title: str = "Custom XYZ", max_zoom
         "max_zoom": str(max_zoom),
     }
     return key
+
+
+def register_mapbox_layer(access_token: str) -> str:
+    """Mapbox Satellite — high-res commercial mosaic (needs free/paid Mapbox token)."""
+    token = (access_token or "").strip()
+    if not token:
+        raise ValueError("Mapbox access token is required (mapbox.com → Account → Tokens)")
+    # Mapbox uses z/x/y (not Esri's z/y/x)
+    LAYERS["mapbox_sat"] = {
+        "url": (
+            "https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.jpg"
+            f"?access_token={token}"
+        ),
+        "attribution": "© Mapbox © OpenStreetMap",
+        "cache": "mapbox_satellite",
+        "title": "Mapbox Satellite (HD)",
+        "max_zoom": "19",
+    }
+    return "mapbox_sat"
+
+
+def register_azure_maps_layer(subscription_key: str) -> str:
+    """Azure Maps imagery (Bing-quality) — needs Azure Maps subscription key."""
+    key = (subscription_key or "").strip()
+    if not key:
+        raise ValueError("Azure Maps subscription key is required")
+    LAYERS["azure_maps"] = {
+        "url": (
+            "https://atlas.microsoft.com/map/tile"
+            "?api-version=2024-04-01&tilesetId=microsoft.imagery"
+            "&zoom={z}&x={x}&y={y}"
+            f"&subscription-key={key}"
+        ),
+        "attribution": "© Microsoft Azure Maps",
+        "cache": "azure_maps_imagery",
+        "title": "Azure Maps Imagery (HD)",
+        "max_zoom": "19",
+    }
+    return "azure_maps"
 
 
 def list_wayback_releases(cache_dir: str | Path | None = None, timeout: float = 20.0) -> list:
@@ -260,7 +294,16 @@ def try_load_cached_tile(
     cache_dir: Path,
     layer: str = "satellite",
 ) -> Optional[np.ndarray]:
-    """Return BGR tile from disk cache only; None if missing/unreadable (no network)."""
+    """Return BGR tile from disk cache only; None if missing/unreadable (no network).
+
+    In offline mode, imported offline map packages are checked first.
+    """
+    from desktop_app.satellite import offline
+
+    if offline.offline_enabled():
+        img = offline.lookup_tile(z, x, y, layer)
+        if img is not None:
+            return img
     path = _tile_path(_layer_cache_dir(cache_dir, layer), z, x, y)
     if not path.exists():
         return None
@@ -282,27 +325,55 @@ def download_tile(
     if cached is not None:
         return cached
 
-    cfg = LAYERS[layer]
-    layer_cache = _layer_cache_dir(cache_dir, layer)
-    path = _tile_path(layer_cache, z, x, y)
+    from desktop_app.satellite.offline import offline_enabled
+
+    if offline_enabled():
+        raise RuntimeError(f"Offline mode: tile z={z} x={x} y={y} is not in the offline maps")
+
+    path = _tile_path(_layer_cache_dir(cache_dir, layer), z, x, y)
     path.parent.mkdir(parents=True, exist_ok=True)
-    url = cfg["url"].format(z=z, y=y, x=x)
+    data = _http_tile(z, x, y, layer, retries=retries, timeout=timeout)
+    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    cv2.imwrite(str(path), img)
+    return img
+
+
+def _http_tile(z: int, x: int, y: int, layer: str, retries: int = 3, timeout: float = 15.0) -> bytes:
+    """Raw (decodable) tile bytes from the layer's server."""
+    url = LAYERS[layer]["url"].format(z=z, y=y, x=x)
     last_err: Optional[Exception] = None
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = resp.read()
-            arr = np.frombuffer(data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
+            if cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR) is None:
                 raise RuntimeError(f"Failed to decode tile z={z} x={x} y={y}")
-            cv2.imwrite(str(path), img)
-            return img
+            return data
         except (urllib.error.URLError, TimeoutError, RuntimeError, OSError) as exc:
             last_err = exc
             time.sleep(0.4 * (attempt + 1))
     raise RuntimeError(f"Tile download failed {url}: {last_err}") from last_err
+
+
+def fetch_tile_bytes(
+    z: int,
+    x: int,
+    y: int,
+    layer: str = "satellite",
+    cache_dir: str | Path | None = None,
+    retries: int = 3,
+    timeout: float = 15.0,
+) -> bytes:
+    """Encoded tile for offline packages: disk cache if present, else network (ignores offline mode)."""
+    root = Path(cache_dir) if cache_dir else Path("data") / "satellite_cache"
+    path = _tile_path(_layer_cache_dir(root, layer), z, x, y)
+    if path.exists():
+        try:
+            return path.read_bytes()
+        except OSError:
+            pass
+    return _http_tile(z, x, y, layer, retries=retries, timeout=timeout)
 
 
 def fetch_mosaic(
@@ -375,6 +446,14 @@ def fetch_mosaic(
             except RuntimeError as exc:
                 failed += 1
                 if failed > max(3, total * 0.3):
+                    from desktop_app.satellite.offline import offline_enabled
+
+                    if offline_enabled():
+                        raise RuntimeError(
+                            f"Offline mode: {failed} of {total} tiles for this area at zoom {zoom} are not in "
+                            "the imported offline maps. Download this area in Offline Mode → Offline Maps, "
+                            "or turn offline mode off."
+                        ) from exc
                     raise RuntimeError(
                         f"Imagery source '{LAYERS[layer].get('title', layer)}' has no data for this area/zoom "
                         f"({failed} tiles failed). Choose another source or a lower zoom."

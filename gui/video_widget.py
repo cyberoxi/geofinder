@@ -20,7 +20,9 @@ class VideoWidget(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(640, 360)
-        self.setStyleSheet("background-color: #1a1a1a; color: #aaa;")
+        self.setStyleSheet(
+            "background-color: #0b1220; color: #64748b; border: 1px solid #243041; border-radius: 8px;"
+        )
         self.setText("Open a video to begin")
         self.setMouseTracking(True)
 

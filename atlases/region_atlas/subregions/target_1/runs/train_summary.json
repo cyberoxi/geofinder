@@ -1,0 +1,28 @@
+{
+  "best_weights": "E:\\Projects\\geofinder\\atlases\\region_atlas\\subregions\\target_1\\runs\\train\\weights\\best.pt",
+  "last_metrics": {
+    "epoch": 16,
+    "metrics": {
+      "metrics/precision(B)": 0.9257247504261251,
+      "metrics/recall(B)": 0.5440161489356391,
+      "metrics/mAP50(B)": 0.6324379667497753,
+      "metrics/mAP50-95(B)": 0.3847285555812656,
+      "metrics/precision(M)": 0.9257247504261251,
+      "metrics/recall(M)": 0.5440161489356391,
+      "metrics/mAP50(M)": 0.6324379667497753,
+      "metrics/mAP50-95(M)": 0.36222354000366236
+    },
+    "stopped": false
+  },
+  "results_dir": "E:\\Projects\\geofinder\\atlases\\region_atlas\\subregions\\target_1\\runs\\train",
+  "device": "0",
+  "settings": {
+    "epochs": 15,
+    "batch": 4,
+    "imgsz": 640,
+    "device": "0",
+    "model": "E:\\Projects\\geofinder\\atlases\\region_atlas\\base_model\\best.pt",
+    "model_type": "segmentation",
+    "data": "E:\\Projects\\geofinder\\atlases\\region_atlas\\subregions\\target_1\\datasets\\dataset_v1\\data.yaml"
+  }
+}

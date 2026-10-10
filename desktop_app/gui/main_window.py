@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,23 +13,30 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from shared.geometry import ROISelector, polygon_to_bbox
+from shared.geometry import polygon_to_bbox
 from shared.logging import setup_logging
+from shared.icons import get_icon
+from shared.theme import apply_theme, style_brand_label
 from shared.qt_compat import (
     Qt,
     QAction,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
+    QImage,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPixmap,
     QProgressBar,
+    QPlainTextEdit,
+    QScrollArea,
+    QSettings,
     QSlider,
     QSplitter,
-    QThread,
+    QStackedWidget,
     QTimer,
+    QToolBar,
     QVBoxLayout,
     QWidget,
     QSpinBox,
@@ -40,971 +45,431 @@ from shared.qt_compat import (
     QListWidget,
     QFormLayout,
     QGroupBox,
-    QLineEdit,
-    QDoubleSpinBox,
-    QCheckBox,
     QApplication,
-    QImage,
-    QPixmap,
-    Signal,
+    QSize,
     qt_exec,
-    mouse_xy,
 )
 from shared.schemas import Annotation, AnnotationSource, ROIType
 from shared.video_reader import VideoReader
 from desktop_app.annotation.interpolate import confirm_interpolated, interpolate_between_keyframes
-from desktop_app.dataset.builder import DatasetBuilder
-from desktop_app.packaging.builder import PackageBuilder, validate_package
-from desktop_app.pipeline.auto import AutoPipeline, AutoPipelineConfig, gpu_name, torch_cuda_ok
+from desktop_app.pipeline.auto import gpu_name, torch_cuda_ok
 from desktop_app.project_manager.manager import ProjectManager
-from desktop_app.satellite import (
-    generate_satellite_videos,
-    load_prepared_scene,
-    prepare_scene,
-    prepare_scene_from_image,
-    read_world_file_mpp,
-    render_scene_videos,
-)
-from desktop_app.satellite.tiles import (
-    list_wayback_releases,
-    mosaic_layers,
-    pick_wayback_dates,
-    register_custom_layer,
-    register_wayback_layer,
-)
-from desktop_app.satellite.objects import sam_available
-from desktop_app.gui.landmark_editor import LandmarkEditorDialog, TargetPickerDialog
-from desktop_app.satellite.map_widget import SatelliteMapPanel
-from desktop_app.training.trainer import TrainingRunner
-
-
-class SatelliteVideoDialog(QDialog):
-    """Interactive satellite map: select region, then generate zoom/pan videos."""
-
-    def __init__(self, out_dir: Path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Generate Satellite Video")
-        self.resize(1100, 720)
-        self.out_dir = Path(out_dir)
-        self.result: Optional[Dict[str, Any]] = None
-        self._worker: Optional[SatelliteWorker] = None
-        self._busy = False
-
-        root = QHBoxLayout(self)
-        self.map_panel = SatelliteMapPanel()
-        root.addWidget(self.map_panel, stretch=3)
-
-        side = QWidget()
-        form = QFormLayout(side)
-        form.addRow(
-            QLabel(
-                "1. Search a place or pan/zoom\n"
-                "2. Toggle Satellite / Map view\n"
-                "3. Select Region → drag a box (the target)\n"
-                "4. Generate — videos are labeled automatically\n"
-                "   (target + landmarks around it), then the\n"
-                "   dataset/train/ONNX/package pipeline can run by itself"
-            )
-        )
-
-        jump_row = QHBoxLayout()
-        self.jump_lat = QDoubleSpinBox()
-        self.jump_lat.setDecimals(5)
-        self.jump_lat.setRange(-85.0, 85.0)
-        self.jump_lat.setValue(35.68920)
-        self.jump_lon = QDoubleSpinBox()
-        self.jump_lon.setDecimals(5)
-        self.jump_lon.setRange(-180.0, 180.0)
-        self.jump_lon.setValue(51.38900)
-        btn_go = QPushButton("Go")
-        btn_go.clicked.connect(self._jump)
-        jump_row.addWidget(self.jump_lat)
-        jump_row.addWidget(self.jump_lon)
-        jump_row.addWidget(btn_go)
-        form.addRow("Jump lat/lon", jump_row)
-
-        # Imagery source
-        self.source = QComboBox()
-        for key, title in mosaic_layers().items():
-            self.source.addItem(title, key)
-        self.source.addItem("Esri Wayback — choose a date…", "__wayback__")
-        self.source.addItem("Custom XYZ tile URL…", "__custom__")
-        self.source.addItem("My own satellite image file…", "__image__")
-        self.source.currentIndexChanged.connect(self._on_source_changed)
-        form.addRow("Imagery / تصویر", self.source)
-        self.wayback_date = QComboBox()
-        self.wayback_date.setVisible(False)
-        form.addRow("", self.wayback_date)
-        self.custom_url = QLineEdit()
-        self.custom_url.setPlaceholderText("https://server/tiles/{z}/{x}/{y}.jpg")
-        self.custom_url.setVisible(False)
-        form.addRow("", self.custom_url)
-        self.extra_dates = QSpinBox()
-        self.extra_dates.setRange(0, 6)
-        self.extra_dates.setValue(2)
-        self.extra_dates.setToolTip(
-            "Also download the same area from N other Esri Wayback dates (other seasons / years) "
-            "and train on them too — same labels, different appearance."
-        )
-        form.addRow("Extra dates (seasons)", self.extra_dates)
-        self._wayback: List[dict] = []
-
-        self.tile_zoom = QSpinBox()
-        self.tile_zoom.setRange(12, 19)
-        self.tile_zoom.setValue(17)
-        self.tile_zoom.setToolTip("Mosaic download zoom (detail). Map zoom is independent.")
-        form.addRow("Download zoom", self.tile_zoom)
-
-        self.zoom_out = QSpinBox()
-        self.zoom_out.setRange(4, 40)
-        self.zoom_out.setValue(20)
-        self.zoom_out.setToolTip(
-            "How many times wider the video starts vs your selection. "
-            "Higher = starts more zoomed out, then flies into the box."
-        )
-        form.addRow("Zoom depth (×)", self.zoom_out)
-
-        self.duration = QDoubleSpinBox()
-        self.duration.setRange(2.0, 60.0)
-        self.duration.setValue(8.0)
-        form.addRow("Duration (s)", self.duration)
-
-        self.fps = QSpinBox()
-        self.fps.setRange(10, 60)
-        self.fps.setValue(24)
-        form.addRow("FPS", self.fps)
-
-        self.mode_zoom = QCheckBox("Zoom flyover")
-        self.mode_zoom.setChecked(True)
-        self.mode_pan = QCheckBox("Horizontal pan")
-        self.mode_pan.setChecked(True)
-        modes = QVBoxLayout()
-        modes.addWidget(self.mode_zoom)
-        modes.addWidget(self.mode_pan)
-        form.addRow("Modes", modes)
-
-        self.auto_label = QCheckBox("Auto-label target + landmarks")
-        self.auto_label.setChecked(True)
-        form.addRow(self.auto_label)
-
-        self.n_landmarks = QSpinBox()
-        self.n_landmarks.setRange(0, 20)
-        self.n_landmarks.setValue(8)
-        self.n_landmarks.setToolTip(
-            "Distinctive objects around the target found automatically. The model learns them too, "
-            "so the target can be located from its surroundings when it is small or out of view."
-        )
-        form.addRow("Landmarks", self.n_landmarks)
-
-        self.n_videos = QSpinBox()
-        self.n_videos.setRange(1, 16)
-        self.n_videos.setValue(6)
-        self.n_videos.setToolTip("Varied clips: rotated/off-centre zooms, low passes, lighting changes")
-        form.addRow("Training videos", self.n_videos)
-
-        self.use_sam = QCheckBox("Detect real objects with FastSAM")
-        self.use_sam.setChecked(sam_available())
-        self.use_sam.setEnabled(sam_available())
-        self.use_sam.setToolTip("Needs FastSAM-s.pt in the project folder; otherwise colour/texture detection is used")
-        form.addRow(self.use_sam)
-
-        self.review = QCheckBox("Review / edit landmarks before building videos")
-        self.review.setChecked(True)
-        form.addRow(self.review)
-
-        self.night_pct = QSpinBox()
-        self.night_pct.setRange(0, 80)
-        self.night_pct.setValue(25)
-        self.night_pct.setSuffix(" %")
-        self.night_pct.setToolTip("Share of training videos rendered as simulated night (streetlights, low light, noise)")
-        form.addRow("Night videos / شب", self.night_pct)
-        self.ir_pct = QSpinBox()
-        self.ir_pct.setRange(0, 60)
-        self.ir_pct.setValue(15)
-        self.ir_pct.setSuffix(" %")
-        self.ir_pct.setToolTip("Share rendered as thermal-like (IR) imagery — for night cameras with IR/thermal sensors")
-        form.addRow("Thermal / IR videos", self.ir_pct)
-
-        self.run_pipeline = QCheckBox("Then run full pipeline (dataset → train → ONNX → package)")
-        self.run_pipeline.setChecked(True)
-        form.addRow(self.run_pipeline)
-        self.auto_label.toggled.connect(self.n_landmarks.setEnabled)
-        self.auto_label.toggled.connect(self.n_videos.setEnabled)
-        self.auto_label.toggled.connect(self.run_pipeline.setEnabled)
-
-        self.sel_label = QLabel("No region selected")
-        self.sel_label.setWordWrap(True)
-        form.addRow(self.sel_label)
-        self.map_panel.map.selection_changed.connect(self._sync_selection_label)
-        self.map_panel.map.view_changed.connect(self._sync_selection_label)
-
-        self.preview = QLabel("Video preview")
-        self.preview.setMinimumHeight(200)
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setStyleSheet("background:#1a1a1a;color:#aaa;border:1px solid #333;")
-        self.preview.setScaledContents(False)
-        form.addRow(self.preview)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-        form.addRow(self.progress)
-
-        self.progress_label = QLabel("")
-        self.progress_label.setWordWrap(True)
-        form.addRow(self.progress_label)
-
-        buttons = QDialogButtonBox()
-        self.btn_generate = buttons.addButton("Generate Video", QDialogButtonBox.AcceptRole)
-        self.btn_cancel = buttons.addButton(QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._try_accept)
-        buttons.rejected.connect(self._on_cancel)
-        form.addRow(buttons)
-
-        root.addWidget(side, stretch=1)
-
-    def _jump(self) -> None:
-        self.map_panel.map.go_to(self.jump_lat.value(), self.jump_lon.value())
-
-    def _sync_selection_label(self) -> None:
-        bbox = self.map_panel.map.selection_bbox()
-        if not bbox:
-            self.sel_label.setText("No region selected — use Select Region and drag a box")
-            return
-        s, w, n, e = bbox
-        self.sel_label.setText(f"S={s:.6f}\nW={w:.6f}\nN={n:.6f}\nE={e:.6f}")
-
-    def _set_controls_enabled(self, enabled: bool) -> None:
-        for w in (
-            self.jump_lat,
-            self.jump_lon,
-            self.tile_zoom,
-            self.zoom_out,
-            self.duration,
-            self.fps,
-            self.mode_zoom,
-            self.mode_pan,
-            self.auto_label,
-            self.n_landmarks,
-            self.n_videos,
-            self.source,
-            self.wayback_date,
-            self.custom_url,
-            self.extra_dates,
-            self.night_pct,
-            self.ir_pct,
-            self.use_sam,
-            self.review,
-            self.run_pipeline,
-            self.btn_generate,
-            self.map_panel,
-        ):
-            w.setEnabled(enabled)
-
-    # ---- imagery source
-    def _on_source_changed(self, _i: int = 0) -> None:
-        src = self.source.currentData()
-        self.wayback_date.setVisible(src == "__wayback__")
-        self.custom_url.setVisible(src == "__custom__")
-        if src == "__wayback__" and self.wayback_date.count() == 0:
-            self.progress_label.setText("Loading Wayback archive dates…")
-            QApplication.processEvents()
-            self._wayback = list_wayback_releases(Path("data") / "satellite_cache")
-            for r in self._wayback:
-                self.wayback_date.addItem(r["date"], r["id"])
-            self.progress_label.setText(f"{len(self._wayback)} imagery dates available" if self._wayback else "Wayback unavailable (offline?)")
-        key = self._layer_key(preview_only=True)
-        if key:
-            try:
-                self.map_panel.map.set_basemap(key)
-            except Exception:  # noqa: BLE001
-                pass
-
-    def _layer_key(self, preview_only: bool = False) -> Optional[str]:
-        src = self.source.currentData()
-        if src == "__wayback__":
-            rid = self.wayback_date.currentData()
-            rel = next((r for r in self._wayback if r["id"] == rid), None)
-            return register_wayback_layer(rel) if rel else None
-        if src == "__custom__":
-            url = self.custom_url.text().strip()
-            if not url:
-                return None
-            try:
-                return register_custom_layer(url)
-            except ValueError as exc:
-                if not preview_only:
-                    QMessageBox.warning(self, "Custom source", str(exc))
-                return None
-        if src == "__image__":
-            return None
-        return src
-
-    def _extra_layers(self, primary: Optional[str]) -> List[str]:
-        n = self.extra_dates.value()
-        if n <= 0:
-            return []
-        if not self._wayback:
-            self._wayback = list_wayback_releases(Path("data") / "satellite_cache")
-        return [register_wayback_layer(r) for r in pick_wayback_dates(self._wayback, n, exclude_key=primary or "")]
-
-    def _start_own_image(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Satellite / aerial image", "", "Images (*.tif *.tiff *.jpg *.jpeg *.png *.bmp)"
-        )
-        if not path:
-            return
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            QMessageBox.critical(self, "Image", f"Cannot read {path}")
-            return
-        mpp = read_world_file_mpp(path)
-        from shared.qt_compat import QInputDialog
-
-        mpp, ok = QInputDialog.getDouble(
-            self,
-            "Ground resolution",
-            "Metres per pixel (ground sample distance) of this image:\n"
-            "(read from the world file when present; e.g. 0.3–1.0 for high-res satellites)",
-            float(mpp or 0.5),
-            0.01,
-            100.0,
-            3,
-        )
-        if not ok:
-            return
-        picker = TargetPickerDialog(img, self)
-        if qt_exec(picker) != QDialog.Accepted:
-            return
-        params = self.params(require_map=False)
-        self._params = params
-        rect = picker.rect
-        out_dir = self.out_dir
-        self._busy = True
-        self._set_controls_enabled(False)
-
-        def job(progress, frame):
-            return prepare_scene_from_image(
-                img,
-                rect,
-                meters_per_px=mpp,
-                out_dir=out_dir,
-                num_landmarks=params["num_landmarks"],
-                use_sam=params["use_sam"],
-                source_name=Path(path).name,
-                progress_cb=progress,
-                frame_cb=frame,
-            )
-
-        self._worker = StageWorker(job)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.frame_ready.connect(self._on_frame)
-        self._worker.finished_ok.connect(self._on_prepared)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.start()
-
-    def _try_accept(self) -> None:
-        if self._busy:
-            return
-        if self.source.currentData() == "__image__":
-            if not self.auto_label.isChecked():
-                QMessageBox.warning(self, "Own image", "Own images require 'Auto-label target + landmarks'.")
-                return
-            self._start_own_image()
-            return
-        if not self.map_panel.map.selection_bbox():
-            QMessageBox.warning(
-                self,
-                "Select Region",
-                "Select a region on the satellite map first.\n"
-                "Click “Select Region”, then drag a rectangle.",
-            )
-            return
-        modes: List[str] = []
-        if self.mode_zoom.isChecked():
-            modes.append("zoom")
-        if self.mode_pan.isChecked():
-            modes.append("pan")
-        if not modes:
-            QMessageBox.warning(self, "Modes", "Select at least one mode (zoom or pan)")
-            return
-
-        self._busy = True
-        self._set_controls_enabled(False)
-        self.progress.setValue(0)
-        self.progress_label.setText("Starting…")
-        self.preview.setText("Downloading…")
-        self.btn_cancel.setText("Cancel")
-
-        params = self.params()
-        if params["auto_label"]:
-            self._start_prepare(params)
-            return
-        self._worker = SatelliteWorker(params, self.out_dir)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.frame_ready.connect(self._on_frame)
-        self._worker.finished_ok.connect(self._on_worker_done)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.start()
-
-    # ---- auto-label flow: prepare (imagery + landmarks) → review → render
-    def _start_prepare(self, params: Dict[str, Any]) -> None:
-        out_dir = self.out_dir
-        layer = self._layer_key() or "satellite"
-        extra = self._extra_layers(layer)
-
-        def job(progress, frame):
-            return prepare_scene(
-                south=params["south"],
-                west=params["west"],
-                north=params["north"],
-                east=params["east"],
-                zoom=params["zoom"],
-                zoom_out_factor=params["zoom_out_factor"],
-                out_dir=out_dir,
-                cache_dir=Path("data") / "satellite_cache",
-                num_landmarks=params["num_landmarks"],
-                use_sam=params["use_sam"],
-                layer=layer,
-                extra_layers=extra,
-                progress_cb=progress,
-                frame_cb=frame,
-            )
-
-        self._params = params
-        self._worker = StageWorker(job)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.frame_ready.connect(self._on_frame)
-        self._worker.finished_ok.connect(self._on_prepared)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.start()
-
-    def _on_prepared(self, prepared: object) -> None:
-        if not self._busy:
-            return
-        layout = prepared.layout
-        if self._params.get("review"):
-            dlg = LandmarkEditorDialog(
-                prepared.mosaic, layout, prepared.candidates, self,
-                extra_mosaics=prepared.extra_mosaics, extra_masks=prepared.extra_masks,
-            )
-            if qt_exec(dlg) != QDialog.Accepted:
-                self._busy = False
-                self._set_controls_enabled(True)
-                self.progress_label.setText("Cancelled at landmark review")
-                return
-            layout = dlg.result_layout()
-            prepared.candidates = dlg.result_candidates()
-            prepared.extra_mosaics, prepared.extra_masks = dlg.result_extras()
-            from desktop_app.satellite.scene import save_candidates
-
-            save_candidates(prepared.candidates_path, prepared.candidates)
-        prepared.save_layout(layout)
-        prepared.save_extras()
-        self._on_frame(cv2.imread(str(prepared.preview_path)))
-        params = self._params
-        out_dir = self.out_dir
-
-        def job(progress, frame):
-            res = render_scene_videos(
-                prepared.all_mosaics(),
-                layout,
-                out_dir,
-                n_videos=params["n_videos"],
-                night_fraction=params.get("night_fraction", 0.0),
-                ir_fraction=params.get("ir_fraction", 0.0),
-                render_modes=params["modes"],
-                duration_s=params["duration_s"],
-                fps=params["fps"],
-                progress_cb=progress,
-                frame_cb=frame,
-            )
-            res.update(prepared.paths())
-            res["run_pipeline"] = bool(params.get("run_pipeline"))
-            return res
-
-        self._worker = StageWorker(job)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.frame_ready.connect(self._on_frame)
-        self._worker.finished_ok.connect(self._on_worker_done)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.start()
-
-    def _on_progress(self, done: int, total: int, message: str) -> None:
-        if total > 0:
-            self.progress.setValue(max(0, min(100, int(100 * done / total))))
-        self.progress_label.setText(message)
-
-    def _on_frame(self, frame: object) -> None:
-        if frame is None or not isinstance(frame, np.ndarray):
-            return
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg.copy()).scaled(
-            self.preview.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.preview.setPixmap(pix)
-
-    def _on_worker_done(self, result: object) -> None:
-        self._busy = False
-        self.result = result if isinstance(result, dict) else {}
-        self.progress.setValue(100)
-        self.progress_label.setText("Done")
-        self.accept()
-
-    def _on_worker_failed(self, err: str) -> None:
-        self._busy = False
-        self._set_controls_enabled(True)
-        self.progress_label.setText(f"Failed: {err}")
-        QMessageBox.critical(self, "Satellite Video", err)
-
-    def _on_cancel(self) -> None:
-        if self._busy and self._worker and self._worker.isRunning():
-            # Soft cancel: disable further UI updates; thread finishes in background
-            self._busy = False
-            try:
-                self._worker.progress.disconnect(self._on_progress)
-                self._worker.frame_ready.disconnect(self._on_frame)
-                self._worker.finished_ok.disconnect(self._on_worker_done)
-                self._worker.failed.disconnect(self._on_worker_failed)
-            except (TypeError, RuntimeError):
-                pass
-        self.reject()
-
-    def closeEvent(self, event):  # noqa: N802
-        if self._busy and self._worker and self._worker.isRunning():
-            self._on_cancel()
-        super().closeEvent(event)
-
-    def params(self, require_map: bool = True) -> Dict[str, Any]:
-        bbox = self.map_panel.map.selection_bbox()
-        if bbox is None:
-            if require_map:
-                raise RuntimeError("No region selected")
-            bbox = (0.0, 0.0, 0.0, 0.0)
-        south, west, north, east = bbox
-        modes: List[str] = []
-        if self.mode_zoom.isChecked():
-            modes.append("zoom")
-        if self.mode_pan.isChecked():
-            modes.append("pan")
-        lat = (south + north) / 2.0
-        lon = (west + east) / 2.0
-        span = max(north - south, east - west)
-        return {
-            "lat": lat,
-            "lon": lon,
-            "span": span,
-            "south": south,
-            "west": west,
-            "north": north,
-            "east": east,
-            "zoom": int(self.tile_zoom.value()),
-            "zoom_out_factor": float(self.zoom_out.value()),
-            "duration_s": float(self.duration.value()),
-            "fps": float(self.fps.value()),
-            "modes": modes,
-            "auto_label": self.auto_label.isChecked(),
-            "num_landmarks": int(self.n_landmarks.value()),
-            "n_videos": int(self.n_videos.value()),
-            "run_pipeline": self.auto_label.isChecked() and self.run_pipeline.isChecked(),
-            "use_sam": self.use_sam.isChecked(),
-            "review": self.review.isChecked(),
-            "night_fraction": self.night_pct.value() / 100.0,
-            "ir_fraction": self.ir_pct.value() / 100.0,
-        }
-
-
-class SatelliteWorker(QThread):
-    finished_ok = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int, int, str)
-    frame_ready = Signal(object)
-
-    def __init__(self, params: Dict[str, Any], out_dir: Path):
-        super().__init__()
-        self.params = params
-        self.out_dir = out_dir
-
-    def run(self):
-        try:
-            result = generate_satellite_videos(
-                lat=self.params["lat"],
-                lon=self.params["lon"],
-                span=self.params.get("span", 0.02),
-                south=self.params.get("south"),
-                west=self.params.get("west"),
-                north=self.params.get("north"),
-                east=self.params.get("east"),
-                zoom=self.params["zoom"],
-                modes=self.params["modes"],
-                out_dir=self.out_dir,
-                duration_s=self.params["duration_s"],
-                fps=self.params["fps"],
-                zoom_out_factor=float(self.params.get("zoom_out_factor", 12)),
-                auto_label=bool(self.params.get("auto_label", True)),
-                num_landmarks=int(self.params.get("num_landmarks", 4)),
-                n_videos=int(self.params.get("n_videos", 6)),
-                cache_dir=Path("data") / "satellite_cache",
-                progress_cb=lambda d, t, m: self.progress.emit(d, t, m),
-                frame_cb=lambda frame: self.frame_ready.emit(frame),
-            )
-            result["run_pipeline"] = bool(self.params.get("run_pipeline"))
-            self.finished_ok.emit(result)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-
-class StageWorker(QThread):
-    """Runs job(progress_cb, frame_cb) off the UI thread."""
-
-    finished_ok = Signal(object)
-    failed = Signal(str)
-    progress = Signal(int, int, str)
-    frame_ready = Signal(object)
-
-    def __init__(self, job):
-        super().__init__()
-        self.job = job
-
-    def run(self):
-        try:
-            res = self.job(lambda d, t, m: self.progress.emit(d, t, m), lambda f: self.frame_ready.emit(f))
-            self.finished_ok.emit(res)
-        except Exception as exc:  # noqa: BLE001
-            import traceback
-
-            traceback.print_exc()
-            self.failed.emit(str(exc))
-
-
-class AutoPipelineWorker(QThread):
-    """Dataset → train → ONNX → package → evaluation, off the UI thread."""
-
-    progress = Signal(str, str, object)
-    finished_ok = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, project_root: Path, cfg: AutoPipelineConfig):
-        super().__init__()
-        self.pipeline = AutoPipeline(
-            project_root, cfg, progress_cb=lambda st, m, pct=None: self.progress.emit(st, m, pct)
-        )
-
-    def request_stop(self) -> None:
-        self.pipeline.request_stop()
-
-    def run(self):
-        try:
-            self.finished_ok.emit(self.pipeline.run())
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-
-class InferenceWorker(QThread):
-    progress = Signal(str)
-    finished_ok = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, weights: Path, video: Path, scene: Optional[Path], out_video: Path, imgsz: int, device: str):
-        super().__init__()
-        self.args = (weights, video, scene, out_video, imgsz, device)
-
-    def run(self):
-        try:
-            from desktop_app.inference.localize import run_on_video
-            from desktop_app.pipeline.auto import resolve_device
-
-            weights, video, scene, out_video, imgsz, device = self.args
-            m = run_on_video(
-                weights,
-                video,
-                scene_json=scene,
-                out_video=out_video,
-                imgsz=imgsz,
-                device=resolve_device(device),
-                progress_cb=lambda d, t, msg: self.progress.emit(msg),
-            )
-            self.finished_ok.emit(m)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-
-class FrameCanvas(QLabel):
-    roi_done = Signal(object)
+from desktop_app.gui.frame_canvas import FrameCanvas
+from desktop_app.gui.train_chart import TrainLiveChart
+from desktop_app.gui.satellite_dialog import SatelliteVideoDialog
+from desktop_app.gui.workers import AutoPipelineWorker
+from desktop_app.gui.pipeline_actions import PipelineActionsMixin
+from desktop_app.gui.atlas_actions import AtlasActionsMixin
+from desktop_app.gui.offline_actions import OfflineActionsMixin
+from desktop_app.gui.serial_actions import SerialActionsMixin
+
+
+class DesktopMainWindow(
+    PipelineActionsMixin, AtlasActionsMixin, OfflineActionsMixin, SerialActionsMixin, QMainWindow
+):
+    APP_TITLE = "سامانه تنگسیری"
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(640, 360)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("background:#1a1a1a;color:#aaa;")
-        self.setText("Open a project and select a video")
-        self._frame = None
-        self._scale = 1.0
-        self._offset = (0, 0)
-        self._mode = None
-        self._points: List = []
-        self._rect_start = None
-        self._cursor = None
-        self._overlay_ann = None
-        self._overlay_objects: List = []
-        self.setMouseTracking(True)
-
-    def set_mode(self, mode: Optional[str]) -> None:
-        self._mode = mode
-        self._points = []
-        self._rect_start = None
-        self.setCursor(Qt.CrossCursor if mode else Qt.ArrowCursor)
-
-    def show_frame(self, frame, annotation=None, objects=None) -> None:
-        """``objects``: auto labels [(class_id, polygon, name), ...]."""
-        self._frame = frame
-        self._overlay_ann = annotation
-        self._overlay_objects = objects or []
-        self._paint()
-
-    def _paint(self) -> None:
-        if self._frame is None:
-            return
-        img = self._frame.copy()
-        if self._overlay_ann is not None:
-            pts = np.array(self._overlay_ann.polygon_points, dtype=np.int32)
-            color = (0, 255, 255) if self._overlay_ann.annotation_source == "interpolated" else (0, 220, 0)
-            cv2.polylines(img, [pts.reshape(-1, 1, 2)], True, color, 2)
-        for cid, poly, name in self._overlay_objects:
-            pts = np.array(poly, dtype=np.int32).reshape(-1, 1, 2)
-            color = (0, 220, 0) if cid == 0 else (0, 160, 255)
-            cv2.polylines(img, [pts], True, color, 2, cv2.LINE_AA)
-            x, y = int(pts[:, 0, 0].min()), int(pts[:, 0, 1].min())
-            cv2.putText(img, name, (x, max(14, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-        if self._mode == "polygon" and self._points:
-            pts = np.array(self._points, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(img, [pts], False, (0, 255, 255), 2)
-        if self._mode == "rectangle" and self._rect_start and self._cursor:
-            cv2.rectangle(img, (int(self._rect_start[0]), int(self._rect_start[1])), (int(self._cursor[0]), int(self._cursor[1])), (0, 255, 255), 2)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg.copy()).scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._scale = pix.width() / w
-        self._offset = ((self.width() - pix.width()) // 2, (self.height() - pix.height()) // 2)
-        self.setPixmap(pix)
-
-    def resizeEvent(self, e):  # noqa: N802
-        super().resizeEvent(e)
-        self._paint()
-
-    def _to_image(self, x, y):
-        if self._frame is None or self._scale <= 0:
-            return None
-        ix = (x - self._offset[0]) / self._scale
-        iy = (y - self._offset[1]) / self._scale
-        h, w = self._frame.shape[:2]
-        if 0 <= ix < w and 0 <= iy < h:
-            return float(ix), float(iy)
-        return None
-
-    def mousePressEvent(self, e):  # noqa: N802
-        pt = self._to_image(*mouse_xy(e))
-        if not pt or not self._mode:
-            return
-        if self._mode == "rectangle" and e.button() == Qt.LeftButton:
-            self._rect_start = pt
-            self._cursor = pt
-        elif self._mode == "polygon":
-            if e.button() == Qt.LeftButton:
-                self._points.append(pt)
-            elif e.button() == Qt.RightButton and len(self._points) >= 3:
-                self._finish_poly()
-        self._paint()
-
-    def mouseMoveEvent(self, e):  # noqa: N802
-        pt = self._to_image(*mouse_xy(e))
-        if pt:
-            self._cursor = pt
-            self._paint()
-
-    def mouseReleaseEvent(self, e):  # noqa: N802
-        if self._mode == "rectangle" and self._rect_start and e.button() == Qt.LeftButton:
-            pt = self._to_image(*mouse_xy(e))
-            if not pt:
-                return
-            try:
-                roi = ROISelector.from_rectangle(self._rect_start[0], self._rect_start[1], pt[0], pt[1])
-                self.roi_done.emit(roi)
-                self._mode = None
-                self.setCursor(Qt.ArrowCursor)
-            except ValueError:
-                pass
-            self._rect_start = None
-            self._paint()
-
-    def mouseDoubleClickEvent(self, e):  # noqa: N802
-        if self._mode == "polygon" and len(self._points) >= 3:
-            self._finish_poly()
-
-    def _finish_poly(self):
-        try:
-            roi = ROISelector.from_polygon([[p[0], p[1]] for p in self._points])
-            self.roi_done.emit(roi)
-            self._mode = None
-            self.setCursor(Qt.ArrowCursor)
-        except ValueError:
-            pass
-        self._paint()
-
-
-class TrainWorker(QThread):
-    progress = Signal(dict)
-    finished_ok = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, runner: TrainingRunner):
-        super().__init__()
-        self.runner = runner
-
-    def run(self):
-        try:
-            result = self.runner.run(progress_cb=lambda d: self.progress.emit(d))
-            self.finished_ok.emit(result)
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-
-
-class DatasetWorker(QThread):
-    """Build YOLO dataset off the UI thread so the window stays responsive."""
-
-    progress = Signal(str)
-    finished_ok = Signal(str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        project_root: Path,
-        model_type: str,
-        every_n: int,
-        augment_per_image: int,
-        class_name: str,
-    ):
-        super().__init__()
-        self.project_root = Path(project_root)
-        self.model_type = model_type
-        self.every_n = every_n
-        self.augment_per_image = augment_per_image
-        self.class_name = class_name
-
-    def run(self):
-        pm = None
-        try:
-            pm = ProjectManager.open(self.project_root)
-            builder = DatasetBuilder(
-                pm,
-                model_type=self.model_type,
-                every_n=self.every_n,
-                augment_per_image=self.augment_per_image,
-                class_name=self.class_name,
-            )
-            out = builder.build(progress_cb=lambda msg: self.progress.emit(msg))
-            self.finished_ok.emit(str(out))
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-        finally:
-            if pm is not None:
-                try:
-                    pm.close()
-                except Exception:
-                    pass
-
-
-class DesktopMainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Desktop Dataset & Deployment Manager")
-        self.resize(1400, 900)
+        self.setWindowTitle(self.APP_TITLE)
+        self.setMinimumSize(960, 640)
+        self.resize(1440, 920)
         self.project: Optional[ProjectManager] = None
         self.reader: Optional[VideoReader] = None
         self.current_video_id: Optional[str] = None
         self._train_worker = None
         self._dataset_worker = None
         self._pipeline_worker: Optional[AutoPipelineWorker] = None
-        self._infer_worker: Optional[InferenceWorker] = None
         self._auto_labels_cache: Dict[str, Any] = {}
         self._build()
+        self._restore_last_project()
+
+    @staticmethod
+    def _app_settings() -> QSettings:
+        return QSettings()
+
+    def _update_window_title(self) -> None:
+        name = ""
+        if self.project and self.project.meta:
+            name = (self.project.meta.project_name or "").strip()
+        self.setWindowTitle(f"{self.APP_TITLE} — {name}" if name else self.APP_TITLE)
+        brand = f"تنگسیری — {name}" if name else "تنگسیری"
+        if hasattr(self, "_tb_brand"):
+            style_brand_label(self._tb_brand, brand)
+
+    def _remember_project(self, path: str | Path) -> None:
+        self._app_settings().setValue("last_project", str(Path(path).resolve()))
+
+    def _restore_last_project(self) -> None:
+        raw = self._app_settings().value("last_project", "")
+        if not raw:
+            return
+        path = Path(str(raw))
+        if not (path / "project.json").exists():
+            return
+        try:
+            self.project = ProjectManager.open(path)
+            self._refresh_videos()
+            self._update_window_title()
+            self.status_box.setText(f"Opened {path}")
+            self.statusBar().showMessage(f"Restored project: {path}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _tb_action(
+        self,
+        text: str,
+        icon_name: str,
+        slot,
+        tip: str = "",
+        shortcut: str = "",
+    ) -> QAction:
+        act = QAction(get_icon(icon_name), text, self)
+        act.triggered.connect(slot)
+        if tip:
+            act.setToolTip(tip)
+            act.setStatusTip(tip)
+        if shortcut:
+            act.setShortcut(shortcut)
+        return act
+
+    def _make_toolbar(self, name: str, object_name: str) -> QToolBar:
+        tb = QToolBar(name)
+        tb.setObjectName(object_name)
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        tb.setIconSize(QSize(20, 20))
+        tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        return tb
+
+    def _build_toolbar(self) -> None:
+        self._tb_main = self._make_toolbar("Main", "mainToolBar")
+        self._tb_pipeline = self._make_toolbar("Pipeline", "pipelineToolBar")
+        self._tb_split = False
+        self._tb_needed_width = 0
+        self.addToolBar(self._tb_main)
+
+        self._tb_brand = QLabel()
+        style_brand_label(self._tb_brand)
+        self._tb_main.addWidget(self._tb_brand)
+        self._tb_main.addSeparator()
+
+        self.act_new = self._tb_action("New", "new", self.new_project, "Create a new project", "Ctrl+N")
+        self.act_open = self._tb_action("Open", "open", self.open_project, "Open project folder", "Ctrl+O")
+        self.act_add = self._tb_action(
+            "Add Video", "add_video", self.add_video, "Add a video to the project", "Ctrl+Shift+V"
+        )
+        self.act_play = self._tb_action("Play", "play", self.play, "Play / stop current video", "Space")
+        self.act_pause = self._tb_action("Pause", "pause", self.pause, "Pause playback")
+        self.act_prev = self._tb_action("Prev", "prev", self.prev_frame, "Previous frame", "Left")
+        self.act_next = self._tb_action("Next", "next", self.next_frame, "Next frame", "Right")
+        self.btn_play = None  # set in transport bar; toggles Play ↔ Stop
+        self.act_sat = self._tb_action(
+            "Satellite", "satellite", self.generate_satellite_video, "Generate satellite training videos"
+        )
+        self.act_landmarks = self._tb_action(
+            "Landmarks", "landmarks", self.edit_landmarks, "Edit scene landmarks"
+        )
+        self.act_path = self._tb_action(
+            "Cam Path", "path", self.design_camera_path, "Design camera path"
+        )
+        self.act_test_vids = self._tb_action(
+            "Test Vids", "test", self.build_test_videos, "Build test videos (with / without target)"
+        )
+        self.act_pipeline = self._tb_action(
+            "Pipeline",
+            "pipeline",
+            self.run_full_pipeline,
+            "Dataset → Train → ONNX → Jetson package",
+        )
+        self.act_dataset = self._tb_action("Dataset", "dataset", self.build_dataset, "Build YOLO dataset")
+        self.act_train = self._tb_action("Train", "train", self.train_yolo, "Train YOLO model")
+        self.act_report = self._tb_action(
+            "Report",
+            "report",
+            self.show_last_train_report,
+            "Training results & improvement tips / گزارش آموزش",
+        )
+        self.act_test = self._tb_action(
+            "Test", "test", self.test_model_on_video, "Live-play video and highlight detected target"
+        )
+        self.act_onnx = self._tb_action("ONNX", "onnx", self.export_onnx, "Export ONNX model")
+        self.act_pkg = self._tb_action("Package", "package", self.build_package, "Build Jetson package")
+        self.act_usb = self._tb_action(
+            "To USB",
+            "usb",
+            self.transfer_package_to_usb,
+            "Copy latest package to USB flash drive",
+        )
+        self.act_validate = self._tb_action(
+            "Validate", "validate", self.validate_pkg, "Validate package ZIP"
+        )
+
+        # Play/Pause/Prev/Next live under the video canvas (not on the toolbar).
+        for act in (self.act_play, self.act_pause, self.act_prev, self.act_next):
+            self.addAction(act)
+
+        self._tb_primary = [
+            self.act_new,
+            self.act_open,
+            self.act_add,
+            None,
+            self.act_sat,
+            self.act_landmarks,
+            self.act_path,
+            self.act_test_vids,
+        ]
+        self._tb_secondary = [
+            self.act_pipeline,
+            self.act_dataset,
+            self.act_train,
+            self.act_report,
+            self.act_test,
+            None,
+            self.act_onnx,
+            self.act_pkg,
+            None,
+            self.act_usb,
+            self.act_validate,
+        ]
+        self._fill_toolbar(self._tb_main, self._tb_primary + [None] + self._tb_secondary)
+        QTimer.singleShot(0, self._adapt_toolbar_layout)
+
+    @staticmethod
+    def _fill_toolbar(tb: QToolBar, items: List[Optional[QAction]]) -> None:
+        for item in items:
+            if item is None:
+                tb.addSeparator()
+            else:
+                tb.addAction(item)
+
+    def _prune_trailing_separators(self, tb: QToolBar) -> None:
+        actions = list(tb.actions())
+        while actions and actions[-1].isSeparator():
+            tb.removeAction(actions.pop())
+        # Also remove consecutive separators left after moving secondary out.
+        prev_sep = False
+        for action in list(tb.actions()):
+            if action.isSeparator():
+                if prev_sep:
+                    tb.removeAction(action)
+                prev_sep = True
+            else:
+                prev_sep = False
+
+    def _set_toolbar_split(self, split: bool) -> None:
+        if split == self._tb_split:
+            return
+        self._tb_split = split
+
+        for act in self._tb_secondary:
+            if act is None:
+                continue
+            self._tb_main.removeAction(act)
+            self._tb_pipeline.removeAction(act)
+
+        self._tb_pipeline.clear()
+        self._prune_trailing_separators(self._tb_main)
+
+        if split:
+            self._fill_toolbar(self._tb_pipeline, self._tb_secondary)
+            self.addToolBar(self._tb_pipeline)
+            self.insertToolBarBreak(self._tb_pipeline)
+            self._tb_pipeline.show()
+        else:
+            try:
+                self.removeToolBarBreak(self._tb_pipeline)
+            except Exception:  # noqa: BLE001
+                pass
+            self.removeToolBar(self._tb_pipeline)
+            self._tb_main.addSeparator()
+            self._fill_toolbar(self._tb_main, self._tb_secondary)
+
+    def _toolbar_content_width(self, tb: QToolBar) -> int:
+        hint = tb.sizeHint().width()
+        if hint > 0:
+            return hint
+        total = 0
+        for action in tb.actions():
+            widget = tb.widgetForAction(action)
+            if widget is not None:
+                total += max(widget.sizeHint().width(), 8)
+            elif action.isSeparator():
+                total += 12
+            else:
+                total += 56
+        return total + 16
+
+    def _adapt_toolbar_layout(self) -> None:
+        if not hasattr(self, "_tb_main"):
+            return
+        if not self._tb_split:
+            self._tb_needed_width = max(
+                self._tb_needed_width, self._toolbar_content_width(self._tb_main)
+            )
+        needed = self._tb_needed_width
+        if needed <= 0:
+            return
+        avail = max(self.width() - 24, 0)
+        # Hysteresis avoids flicker at the decision boundary.
+        if not self._tb_split and avail < needed:
+            self._set_toolbar_split(True)
+        elif self._tb_split and avail > needed + 80:
+            self._set_toolbar_split(False)
+            self._tb_needed_width = self._toolbar_content_width(self._tb_main)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._adapt_toolbar_layout()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        QTimer.singleShot(0, self._adapt_toolbar_layout)
 
     def _build(self):
         menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-        file_menu.addAction(QAction("New Project…", self, triggered=self.new_project))
-        file_menu.addAction(QAction("Open Project…", self, triggered=self.open_project))
-        file_menu.addAction(QAction("Add Video…", self, triggered=self.add_video))
+        file_menu = menubar.addMenu("&File")
+        file_menu.addAction(self._tb_action("New Project…", "new", self.new_project, shortcut="Ctrl+N"))
+        file_menu.addAction(self._tb_action("Open Project…", "open", self.open_project, shortcut="Ctrl+O"))
+        file_menu.addAction(self._tb_action("Add Video…", "add_video", self.add_video))
         file_menu.addSeparator()
         file_menu.addAction(QAction("Exit", self, triggered=self.close))
 
-        tools_menu = menubar.addMenu("Tools")
+        tools_menu = menubar.addMenu("&Tools")
         tools_menu.addAction(
-            QAction("Generate Satellite Video…", self, triggered=self.generate_satellite_video)
+            self._tb_action("Generate Satellite Video…", "satellite", self.generate_satellite_video)
         )
-        tools_menu.addAction(QAction("Edit Landmarks… / ویرایش شاخص‌ها", self, triggered=self.edit_landmarks))
-        tools_menu.addAction(QAction("Run Full Pipeline", self, triggered=self.run_full_pipeline))
-        tools_menu.addAction(QAction("Test Model on Video…", self, triggered=self.test_model_on_video))
+        tools_menu.addAction(self._tb_action("Edit Landmarks…", "landmarks", self.edit_landmarks))
+        tools_menu.addAction(self._tb_action("Design Camera Path…", "path", self.design_camera_path))
+        tools_menu.addAction(self._tb_action("Build Test Videos…", "test", self.build_test_videos))
+        tools_menu.addAction(self._tb_action("Run Full Pipeline", "pipeline", self.run_full_pipeline))
+        tools_menu.addAction(
+            self._tb_action("Live Test Model on Video…", "test", self.test_model_on_video)
+        )
+        tools_menu.addAction(
+            self._tb_action("Copy Package to USB…", "usb", self.transfer_package_to_usb)
+        )
+
+        atlas_menu = menubar.addMenu("Region &Atlas")
+        atlas_menu.addAction(
+            self._tb_action(
+                "Build Region Base Model…", "satellite", self.build_region_atlas,
+                tip="Select a large area and train one base model for all of it",
+            )
+        )
+        atlas_menu.addAction(
+            self._tb_action(
+                "Fine-tune Sub-region from Atlas…", "train", self.finetune_from_atlas,
+                tip="Pick a target inside an atlas — fast fine-tune from the base model",
+            )
+        )
+        self._build_offline_menu()
+        self._build_serial_menu()
+
+        self._build_toolbar()
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
         splitter = QSplitter(Qt.Horizontal)
         layout.addWidget(splitter)
 
         left = QWidget()
+        left.setMinimumWidth(240)
         lv = QVBoxLayout(left)
+        lv.setContentsMargins(4, 4, 4, 4)
+        title_v = QLabel("VIDEOS")
+        title_v.setObjectName("panelTitle")
+        lv.addWidget(title_v)
         self.video_list = QListWidget()
         self.video_list.currentRowChanged.connect(self._on_video_selected)
-        lv.addWidget(QLabel("Videos"))
-        lv.addWidget(self.video_list)
+        lv.addWidget(self.video_list, stretch=2)
         self.meta_label = QLabel("—")
         self.meta_label.setWordWrap(True)
+        self.meta_label.setStyleSheet("color:#94a3b8;font-size:12px;")
         lv.addWidget(self.meta_label)
-        self.ann_list = QListWidget()
-        lv.addWidget(QLabel("Annotations (timeline)"))
-        lv.addWidget(self.ann_list)
-        self.ann_list.itemClicked.connect(self._on_ann_clicked)
+        title_l = QLabel("LOG")
+        title_l.setObjectName("panelTitle")
+        lv.addWidget(title_l)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setStyleSheet(
+            "font-family:Consolas,'Cascadia Mono',monospace;font-size:11px;"
+            "background:#0b1220;border:1px solid #243041;border-radius:6px;"
+        )
+        lv.addWidget(self.log_view, stretch=1)
+        log_row = QHBoxLayout()
+        b_log_clear = QPushButton("Clear")
+        b_log_clear.clicked.connect(self.log_view.clear)
+        b_log_save = QPushButton("Save log…")
+        b_log_save.setIcon(get_icon("save"))
+        b_log_save.clicked.connect(self._save_log)
+        log_row.addWidget(b_log_clear)
+        log_row.addWidget(b_log_save)
+        lv.addLayout(log_row)
         splitter.addWidget(left)
 
         mid = QWidget()
         mv = QVBoxLayout(mid)
+        mv.setContentsMargins(4, 4, 4, 4)
+        self.mid_stack = QStackedWidget()
         self.canvas = FrameCanvas()
         self.canvas.roi_done.connect(self._on_roi)
-        mv.addWidget(self.canvas, stretch=1)
+        self.train_chart = TrainLiveChart()
+        self.train_chart.btn_back.clicked.connect(self._show_video_canvas)
+        self.mid_stack.addWidget(self.canvas)
+        self.mid_stack.addWidget(self.train_chart)
+        mv.addWidget(self.mid_stack, stretch=1)
+
+        transport = QHBoxLayout()
+        transport.setSpacing(6)
+        transport.addStretch(1)
+        for act in (self.act_prev, self.act_play, self.act_next):
+            btn = QPushButton(act.icon(), act.text())
+            btn.setToolTip(act.toolTip() or act.text())
+            btn.setMinimumHeight(32)
+            btn.setMinimumWidth(72)
+            btn.clicked.connect(lambda _checked=False, a=act: a.trigger())
+            if act is self.act_play:
+                self.btn_play = btn
+            transport.addWidget(btn)
+        transport.addStretch(1)
+        mv.addLayout(transport)
+
         tl = QHBoxLayout()
+        tl.setSpacing(8)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self._seek)
         self.frame_spin = QSpinBox()
+        self.frame_spin.setFixedWidth(90)
         self.frame_spin.valueChanged.connect(self.slider.setValue)
-        tl.addWidget(self.slider)
+        frame_lbl = QLabel("Frame")
+        frame_lbl.setStyleSheet("color:#94a3b8;")
+        tl.addWidget(self.slider, stretch=1)
+        tl.addWidget(frame_lbl)
         tl.addWidget(self.frame_spin)
         mv.addLayout(tl)
-        btns = QHBoxLayout()
-        for text, slot in [
-            ("Play", self.play),
-            ("Pause", self.pause),
-        ]:
-            b = QPushButton(text)
-            b.clicked.connect(slot)
-            btns.addWidget(b)
-        mv.addLayout(btns)
         self.preview = QLabel("ROI preview")
-        self.preview.setFixedHeight(120)
+        self.preview.setFixedHeight(110)
         self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet(
+            "background:#0b1220;color:#64748b;border:1px solid #243041;border-radius:8px;"
+        )
         mv.addWidget(self.preview)
         splitter.addWidget(mid)
 
         right = QWidget()
+        right.setMinimumWidth(280)
+        right.setMaximumWidth(360)
         rv = QVBoxLayout(right)
-        box = QGroupBox("Dataset / Train / Package")
+        rv.setContentsMargins(4, 4, 4, 4)
+        rv.setSpacing(8)
+        box = QGroupBox("Training Settings")
         form = QFormLayout(box)
+        form.setSpacing(8)
         self.model_type = QComboBox()
         self.model_type.addItems(["segmentation", "detection"])
         form.addRow("Model type", self.model_type)
@@ -1044,29 +509,63 @@ class DesktopMainWindow(QMainWindow):
         self.device.currentIndexChanged.connect(self._on_device_changed)
         form.addRow("Train on", self.device)
         rv.addWidget(box)
+
         self.btn_train = None
         self.btn_build = None
-        self.btn_pipeline = QPushButton("▶ Run Full Pipeline")
-        self.btn_pipeline.setToolTip("Dataset → Train → ONNX → Jetson package → evaluation, automatically")
-        self.btn_pipeline.setStyleSheet("font-weight:bold;padding:6px;")
+        self.btn_pipeline = QPushButton("  Run Full Pipeline")
+        self.btn_pipeline.setObjectName("primaryButton")
+        self.btn_pipeline.setIcon(get_icon("pipeline"))
+        self.btn_pipeline.setIconSize(QSize(18, 18))
+        self.btn_pipeline.setToolTip("Dataset → Train → ONNX → Jetson package → evaluation")
         self.btn_pipeline.clicked.connect(self.run_full_pipeline)
         rv.addWidget(self.btn_pipeline)
-        for text, slot in [
-            ("Edit Landmarks… / شاخص‌ها", self.edit_landmarks),
-            ("Test Model on Video…", self.test_model_on_video),
-            ("Build Dataset", self.build_dataset),
-            ("Train YOLO", self.train_yolo),
-            ("Export ONNX", self.export_onnx),
-            ("Build Jetson Package", self.build_package),
-            ("Validate Package", self.validate_pkg),
+
+        actions_box = QGroupBox("Actions")
+        actions_outer = QVBoxLayout(actions_box)
+        actions_outer.setContentsMargins(6, 6, 6, 6)
+        actions_outer.setSpacing(0)
+        actions_inner = QWidget()
+        actions_layout = QVBoxLayout(actions_inner)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(6)
+        for text, icon_name, slot, key in [
+            ("Region Atlas: Build Base Model", "satellite", self.build_region_atlas, None),
+            ("Region Atlas: Fine-tune Sub-region", "train", self.finetune_from_atlas, None),
+            ("Edit Landmarks", "landmarks", self.edit_landmarks, None),
+            ("Camera Path", "path", self.design_camera_path, None),
+            ("Build Test Videos", "test", self.build_test_videos, None),
+            ("Live Test Model on Video", "test", self.test_model_on_video, None),
+            ("Build Dataset", "dataset", self.build_dataset, "build"),
+            ("Train YOLO", "train", self.train_yolo, "train"),
+            ("Training Report", "report", self.show_last_train_report, None),
+            ("Export ONNX", "onnx", self.export_onnx, None),
+            ("Build Jetson Package", "package", self.build_package, None),
+            ("Copy Package to USB", "usb", self.transfer_package_to_usb, None),
+            ("Validate Package", "validate", self.validate_pkg, None),
         ]:
-            b = QPushButton(text)
+            b = QPushButton(f"  {text}")
+            b.setIcon(get_icon(icon_name))
+            b.setIconSize(QSize(16, 16))
+            b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(slot)
-            rv.addWidget(b)
-            if text == "Train YOLO":
+            actions_layout.addWidget(b)
+            if key == "train":
                 self.btn_train = b
-            if text == "Build Dataset":
+            if key == "build":
                 self.btn_build = b
+        actions_scroll = QScrollArea()
+        actions_scroll.setWidgetResizable(True)
+        actions_scroll.setWidget(actions_inner)
+        no_frame = getattr(QFrame, "NoFrame", None) or QFrame.Shape.NoFrame
+        actions_scroll.setFrameShape(no_frame)
+        h_off = getattr(Qt, "ScrollBarAlwaysOff", None) or Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        v_on = getattr(Qt, "ScrollBarAsNeeded", None) or Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        actions_scroll.setHorizontalScrollBarPolicy(h_off)
+        actions_scroll.setVerticalScrollBarPolicy(v_on)
+        actions_scroll.setMinimumHeight(120)
+        actions_outer.addWidget(actions_scroll)
+        rv.addWidget(actions_box, stretch=1)
+
         self.task_progress = QProgressBar()
         self.task_progress.setRange(0, 100)
         self.task_progress.setValue(0)
@@ -1075,14 +574,20 @@ class DesktopMainWindow(QMainWindow):
         self.task_progress.setMinimumHeight(22)
         rv.addWidget(self.task_progress)
         self.task_stage = QLabel("")
-        self.task_stage.setStyleSheet("font-weight:bold;")
+        self.task_stage.setStyleSheet("font-weight:600;color:#14b8a6;")
         rv.addWidget(self.task_stage)
         self.status_box = QLabel("Ready")
         self.status_box.setWordWrap(True)
+        self.status_box.setStyleSheet(
+            "background:#151b24;border:1px solid #243041;border-radius:8px;"
+            "padding:10px;color:#cbd5e1;"
+        )
         rv.addWidget(self.status_box)
-        rv.addStretch(1)
         splitter.addWidget(right)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([280, 780, 320])
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._play_step)
@@ -1102,20 +607,44 @@ class DesktopMainWindow(QMainWindow):
             name = Path(path).name
         if not ok:
             return
-        self.project = ProjectManager.create(path, name or "project")
-        self._refresh_videos()
-        self.status_box.setText(f"Created project at {path}")
+        try:
+            if self.project:
+                self.project.close()
+            self.project = None
+            self._unload_video()
+            self.project = ProjectManager.create(path, name or "project")
+            self._remember_project(path)
+            self._refresh_videos()
+            self._update_window_title()
+            self.status_box.setText(f"Created project at {path}")
+        except Exception as exc:  # noqa: BLE001
+            self.project = None
+            self._update_window_title()
+            QMessageBox.critical(self, "Error", str(exc))
 
     def open_project(self):
         path = QFileDialog.getExistingDirectory(self, "Open project folder")
         if not path:
             return
+        self._open_project_path(path)
+
+    def _open_project_path(self, path) -> bool:
         try:
+            if self.project:
+                self.project.close()
+            self.project = None
+            self._unload_video()
             self.project = ProjectManager.open(path)
+            self._remember_project(path)
             self._refresh_videos()
+            self._update_window_title()
             self.status_box.setText(f"Opened {path}")
+            return True
         except Exception as exc:  # noqa: BLE001
+            self.project = None
+            self._update_window_title()
             QMessageBox.critical(self, "Error", str(exc))
+            return False
 
     def add_video(self):
         if not self.project:
@@ -1147,13 +676,24 @@ class DesktopMainWindow(QMainWindow):
         added = []
         first_row = None
         try:
-            items = paths.get("videos") or [
-                {"path": paths[k], "labels": None} for k in ("zoom", "pan") if paths.get(k) is not None
-            ]
+            raw = paths.get("videos")
+            if raw is None:
+                raw = [
+                    {"path": paths[k], "labels": None}
+                    for k in ("zoom", "pan")
+                    if paths.get(k) is not None
+                ]
+            items = list(raw)
             for item in items:
-                asset = self.project.add_video(item["path"])
-                if item.get("labels"):
-                    self.project.attach_auto_labels(asset.video_id, item["labels"])
+                vpath = Path(item["path"])
+                labels = item.get("labels")
+                if not labels:
+                    sidecar = vpath.with_name(vpath.stem + ".labels.json")
+                    if sidecar.exists():
+                        labels = sidecar
+                asset = self.project.add_video(vpath)
+                if labels:
+                    self.project.attach_auto_labels(asset.video_id, labels)
                 added.append(asset.display_name)
                 if first_row is None and self.project.meta:
                     first_row = len(self.project.meta.videos) - 1
@@ -1169,6 +709,14 @@ class DesktopMainWindow(QMainWindow):
             self.statusBar().showMessage("Satellite video ready")
             if first_row is not None:
                 self.video_list.setCurrentRow(first_row)
+            if not added:
+                QMessageBox.warning(
+                    self,
+                    "Satellite Video",
+                    "No videos were imported into the project.\n"
+                    "Check exports/satellite — if MP4 files are there, use Add Video or Generate again.",
+                )
+                return
             if paths.get("run_pipeline"):
                 self.run_full_pipeline()
             else:
@@ -1180,12 +728,78 @@ class DesktopMainWindow(QMainWindow):
 
     # ------------------------------------------------------------ automatic pipeline
 
+    # ------------------------------------------------------------ log
+    def log(self, msg: str, level: str = "info") -> None:
+        from datetime import datetime
+
+        prefix = {"info": "", "ok": "✔ ", "warn": "⚠ ", "error": "✖ ", "head": "■ "}.get(level, "")
+        self.log_view.appendPlainText(f"[{datetime.now():%H:%M:%S}] {prefix}{msg}")
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+
+    def _save_log(self) -> None:
+        start = str(self.project.root / "pipeline_log.txt") if self.project else "pipeline_log.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Save log", start, "Text (*.txt)")
+        if path:
+            Path(path).write_text(self.log_view.toPlainText(), encoding="utf-8")
+
+    @staticmethod
+    def _fsize(path) -> str:
+        try:
+            n = Path(path).stat().st_size
+        except OSError:
+            return "missing"
+        for unit in ("B", "KB", "MB", "GB"):
+            if n < 1024 or unit == "GB":
+                return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+            n /= 1024.0
+        return ""
+
+    def _log_file(self, label: str, path) -> None:
+        if path:
+            self.log(f"   {label}: {path}  ({self._fsize(path)})")
+
+    def _log_train_report(self, train: dict) -> None:
+        """Final training metrics + saved files."""
+        m = (train or {}).get("last_metrics", {}).get("metrics", {}) if train else {}
+        pretty = {
+            "metrics/precision(B)": "Precision (box)",
+            "metrics/recall(B)": "Recall (box)",
+            "metrics/mAP50(B)": "mAP50 (box)",
+            "metrics/mAP50-95(B)": "mAP50-95 (box)",
+            "metrics/precision(M)": "Precision (mask)",
+            "metrics/recall(M)": "Recall (mask)",
+            "metrics/mAP50(M)": "mAP50 (mask)",
+            "metrics/mAP50-95(M)": "mAP50-95 (mask)",
+        }
+        self.log("Training finished / آموزش تمام شد", "head")
+        self.log(f"   device: {train.get('device', '?')}   epochs run: {(train.get('last_metrics') or {}).get('epoch', '?')}")
+        for k, name in pretty.items():
+            if k in m:
+                self.log(f"   {name:18s} {m[k]:.3f}")
+        best = train.get("best_weights")
+        self._log_file("best weights (best.pt)", best)
+        if best:
+            last = Path(best).with_name("last.pt")
+            if last.exists():
+                self._log_file("last weights", last)
+        res_dir = train.get("results_dir")
+        if res_dir:
+            self.log(f"   training plots / results: {res_dir}")
+            for f in ("results.csv", "results.png", "confusion_matrix.png", "BoxPR_curve.png", "MaskPR_curve.png"):
+                if (Path(res_dir) / f).exists():
+                    self._log_file(f, Path(res_dir) / f)
+
     def _device_value(self) -> str:
         return self.device.currentData() or "auto"
 
     def _on_device_changed(self, _i: int = 0) -> None:
         if self._device_value() == "0" and not self._cuda:
-            QMessageBox.information(self, "GPU", """ + repr(CUDA_HELP) + """)
+            QMessageBox.information(
+                self,
+                "GPU",
+                "CUDA PyTorch is not available in this environment.\n"
+                "Install a CUDA build of torch, or switch Train on → CPU / Auto.",
+            )
 
     def _set_task_progress(self, stage: str, pct, msg: str = "") -> None:
         names = {
@@ -1194,9 +808,19 @@ class DesktopMainWindow(QMainWindow):
             "onnx": "Exporting ONNX",
             "package": "Jetson package / پکیج جتسون",
             "evaluate": "Evaluating / ارزیابی",
+            "render": "Rendering videos / ساخت ویدیو",
+            "atlas": "Region atlas / اطلس منطقه",
             "done": "Done / پایان",
         }
+        if stage != getattr(self, "_last_stage", None):
+            self.log(names.get(stage, stage), "head")
+            self._last_stage = stage
+        if msg and " batch " not in msg and msg != getattr(self, "_last_log_msg", None):
+            self.log(msg)
+            self._last_log_msg = msg
         self.task_stage.setText(names.get(stage, stage))
+        if isinstance(pct, dict):
+            pct = pct.get("pct")
         if pct is None:
             self.task_progress.setRange(0, 0)  # busy indicator
         else:
@@ -1205,182 +829,43 @@ class DesktopMainWindow(QMainWindow):
         if msg:
             self.status_box.setText(msg)
 
-    def run_full_pipeline(self):
-        if not self.project:
-            QMessageBox.warning(self, "Pipeline", "Create or open a project first")
-            return
-        if self._pipeline_worker is not None and self._pipeline_worker.isRunning():
-            if QMessageBox.question(self, "Pipeline", "Pipeline is running. Stop it?") == QMessageBox.Yes:
-                self._pipeline_worker.request_stop()
-            return
-        try:
-            import ultralytics  # noqa: F401
-        except ImportError:
-            QMessageBox.critical(self, "Pipeline", "ultralytics / torch are not installed in this environment.")
-            return
-        if self._device_value() == "0" and not self._cuda:
-            QMessageBox.information(self, "GPU", """ + repr(CUDA_HELP) + """)
-        self._set_task_progress("dataset", 0, "Starting pipeline…")
-        cfg = AutoPipelineConfig(
-            model_type=self.model_type.currentText(),
-            epochs=self.epochs.value(),
-            batch=self.batch.value(),
-            imgsz=self.imgsz.value(),
-            device=self._device_value(),
-            augment_per_image=self.aug_n.value(),
-        )
+    def _unload_video(self) -> None:
+        """Drop the open reader / canvas so a previous project's video is not shown."""
         self.pause()
-        self._pipeline_worker = AutoPipelineWorker(self.project.root, cfg)
-        self._pipeline_worker.progress.connect(self._on_pipeline_progress)
-        self._pipeline_worker.finished_ok.connect(self._on_pipeline_ok)
-        self._pipeline_worker.failed.connect(self._on_pipeline_failed)
-        self.btn_pipeline.setText("■ Stop Pipeline")
-        self._pipeline_worker.start()
-        self.statusBar().showMessage("Automatic pipeline running…")
-
-    def _on_pipeline_progress(self, stage: str, msg: str, pct=None):
-        self._set_task_progress(stage, pct, msg)
-        self.statusBar().showMessage(f"Pipeline: {stage}" + ("" if pct is None else f" {float(pct):.0f}%"))
-
-    def _on_pipeline_ok(self, summary: dict):
-        self._set_task_progress("done", 100)
-        self.btn_pipeline.setText("▶ Run Full Pipeline")
-        self.statusBar().showMessage("Pipeline finished")
-        lines = []
-        if summary.get("package"):
-            lines.append(f"Jetson package:\n{summary['package']}")
-        if summary.get("onnx"):
-            lines.append(f"ONNX: {summary['onnx']}")
-        for m in summary.get("evaluation") or []:
-            lines.append(
-                f"Held-out test: recall {m.get('recall', 0):.0%}, mean IoU {m.get('mean_iou', 0):.2f}, "
-                f"located via landmarks {m['inferred_from_landmarks_rate']:.0%}\n  video: {m.get('output_video')}"
-            )
-        lines.append(f"Summary: {summary.get('summary_path')}")
-        self.status_box.setText("\n".join(lines))
-        QMessageBox.information(self, "Pipeline finished", "\n\n".join(lines))
-
-    def _on_pipeline_failed(self, err: str):
-        self.task_progress.setRange(0, 100)
-        self.task_stage.setText("Failed / خطا")
-        self.btn_pipeline.setText("▶ Run Full Pipeline")
-        self.statusBar().showMessage("Pipeline failed")
-        self.status_box.setText(f"Pipeline failed: {err}")
-        QMessageBox.critical(self, "Pipeline", err)
-
-    def edit_landmarks(self):
-        """Review / change the landmarks of this project's scene, then rebuild the labeled videos."""
-        if not self.project:
-            QMessageBox.warning(self, "Landmarks", "Create or open a project first")
-            return
-        if not self.project.scene_path.exists():
-            QMessageBox.information(
-                self, "Landmarks", "No scene yet — use Tools → Generate Satellite Video… (auto-label) first."
-            )
-            return
-        try:
-            prepared = load_prepared_scene(self.project.scene_dir, mosaic_name="mosaic.jpg")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Landmarks", str(exc))
-            return
-        dlg = LandmarkEditorDialog(
-            prepared.mosaic, prepared.layout, prepared.candidates, self,
-            extra_mosaics=prepared.extra_mosaics, extra_masks=prepared.extra_masks,
-        )
-        if qt_exec(dlg) != QDialog.Accepted:
-            return
-        layout = dlg.result_layout()
-        prepared.extra_mosaics, prepared.extra_masks = dlg.result_extras()
-        from desktop_app.satellite.scene import save_candidates
-
-        save_candidates(self.project.scene_dir / "candidates.json", dlg.result_candidates())
-        prepared.out_dir = self.project.scene_dir
-        prepared.save_extras()
-        layout.save(self.project.scene_path)
-        from desktop_app.satellite.scene import draw_scene_preview
-
-        cv2.imwrite(str(self.project.scene_dir / "scene_preview.jpg"), draw_scene_preview(prepared.mosaic, layout))
-        auto_ids = [v.video_id for v in self.project.meta.videos if self.project.auto_labels_path(v.video_id)]
-        ans = QMessageBox.question(
-            self,
-            "Landmarks",
-            f"Landmarks saved ({layout.num_landmarks}).\n\n"
-            f"Rebuild the {len(auto_ids)} auto-labeled videos with the new landmarks and run the full pipeline?\n"
-            "(old auto-labeled videos are removed from the project)",
-        )
-        if ans != QMessageBox.Yes:
-            return
-        for vid in auto_ids:
-            self.project.remove_video(vid)
+        if self.reader:
+            self.reader.release()
+            self.reader = None
+        self.current_video_id = None
         self._auto_labels_cache.clear()
-        out_dir = self.project.exports_dir / f"satellite_{np.random.randint(1e9):09d}"
-        n_videos = max(1, len(auto_ids) or 6)
-
-        def job(progress, frame):
-            res = render_scene_videos(
-                prepared.all_mosaics(), layout, out_dir, n_videos=n_videos,
-                night_fraction=0.25, ir_fraction=0.15, progress_cb=progress, frame_cb=frame,
-            )
-            res["run_pipeline"] = True
-            return res
-
-        self._stage_worker = StageWorker(job)
-        self._stage_worker.progress.connect(lambda d, t, m: self.status_box.setText(f"{m} ({d}%)"))
-        self._stage_worker.finished_ok.connect(self._on_satellite_done)
-        self._stage_worker.failed.connect(lambda e: QMessageBox.critical(self, "Landmarks", e))
-        self._stage_worker.start()
-        self.status_box.setText("Rendering videos with the new landmarks…")
-
-    def test_model_on_video(self):
-        """Run the trained model on any video: target (green), from landmarks (magenta), landmarks (orange)."""
-        if not self.project:
-            QMessageBox.warning(self, "Test", "Create or open a project first")
-            return
-        weights = sorted(self.project.runs_dir.glob("**/weights/best.pt"), key=lambda p: p.stat().st_mtime)
-        if not weights:
-            QMessageBox.warning(self, "Test", "Train a model first (Run Full Pipeline)")
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "Video to test", "", "Videos (*.mp4 *.avi *.mkv *.mov)")
-        if not path:
-            return
-        out_video = self.project.exports_dir / "evaluation" / f"{Path(path).stem}_localized.mp4"
-        scene = self.project.scene_path if self.project.scene_path.exists() else None
-        self._infer_worker = InferenceWorker(weights[-1], Path(path), scene, out_video, self.imgsz.value(), self._device_value())
-        self._infer_worker.progress.connect(self.status_box.setText)
-        self._infer_worker.finished_ok.connect(self._on_infer_ok)
-        self._infer_worker.failed.connect(lambda e: QMessageBox.critical(self, "Test", e))
-        self._infer_worker.start()
-        self.status_box.setText("Running model on video…")
-
-    def _on_infer_ok(self, m: dict):
-        msg = (
-            f"Frames: {m['frames']}\n"
-            f"Target detected directly: {m['target_detected_rate']:.0%}\n"
-            f"Target located from landmarks: {m['inferred_from_landmarks_rate']:.0%}\n"
-            f"Located overall: {m['located_rate']:.0%}\n\n"
-            f"Output video:\n{m['output_video']}"
-        )
-        self.status_box.setText(msg)
-        try:
-            asset = self.project.add_video(m["output_video"])
-            self._refresh_videos()
-            msg += f"\n\n(added to video list as {asset.display_name})"
-        except Exception:  # noqa: BLE001
-            pass
-        QMessageBox.information(self, "Test result", msg)
+        self.canvas.clear()
+        self.preview.clear()
+        self.preview.setText("ROI preview")
+        self.meta_label.setText("—")
+        self.slider.blockSignals(True)
+        self.frame_spin.blockSignals(True)
+        self.slider.setRange(0, 0)
+        self.slider.setValue(0)
+        self.frame_spin.setRange(0, 0)
+        self.frame_spin.setValue(0)
+        self.slider.blockSignals(False)
+        self.frame_spin.blockSignals(False)
 
     def _refresh_videos(self):
+        self.video_list.blockSignals(True)
         self.video_list.clear()
-        if not self.project or not self.project.meta:
-            return
-        for v in self.project.meta.videos:
-            tag = " [auto-labeled]" if self.project.auto_labels_path(v.video_id) else ""
-            self.video_list.addItem(
-                f"{v.display_name}{tag} [{v.video_id}] {v.width}x{v.height} {v.fps:.1f}fps {v.frame_count}f"
-            )
+        if self.project and self.project.meta:
+            for v in self.project.meta.videos:
+                tag = " [auto-labeled]" if self.project.auto_labels_path(v.video_id) else ""
+                self.video_list.addItem(
+                    f"{v.display_name}{tag} [{v.video_id}] {v.width}x{v.height} {v.fps:.1f}fps {v.frame_count}f"
+                )
+        self.video_list.blockSignals(False)
+        if self.video_list.count() == 0:
+            self._unload_video()
 
     def _on_video_selected(self, row: int):
         if row < 0 or not self.project or not self.project.meta:
+            self._unload_video()
             return
         asset = self.project.meta.videos[row]
         self.current_video_id = asset.video_id
@@ -1393,15 +878,8 @@ class DesktopMainWindow(QMainWindow):
         self.meta_label.setText(
             f"{asset.relative_path}\n{asset.width}x{asset.height} | {asset.fps:.2f} FPS | {asset.frame_count} frames | {asset.duration:.1f}s"
         )
+        self._show_video_canvas()
         self._seek(0)
-        self._refresh_anns()
-
-    def _refresh_anns(self):
-        self.ann_list.clear()
-        if not self.project or not self.current_video_id:
-            return
-        for a in self.project.list_annotations(self.current_video_id):
-            self.ann_list.addItem(f"f{a.frame_id} {a.annotation_source} zoom={a.zoom_level:.2f}")
 
     def _seek(self, value: int):
         if not self.reader:
@@ -1449,11 +927,42 @@ class DesktopMainWindow(QMainWindow):
             self.preview.setText("Preview unavailable")
 
     def play(self):
+        """Toggle: start playback, or stop if already playing."""
+        if self._timer.isActive():
+            self.pause()
+            return
         if self.reader:
+            self._show_video_canvas()
             self._timer.start(int(1000 / max(self.reader.fps, 1)))
+            self._set_play_button(playing=True)
 
     def pause(self):
         self._timer.stop()
+        self._set_play_button(playing=False)
+
+    def _set_play_button(self, playing: bool):
+        if playing:
+            tip = "Stop playback"
+            text, icon = "Stop", get_icon("stop")
+        else:
+            tip = "Play / stop current video"
+            text, icon = "Play", get_icon("play")
+        self.act_play.setText(text)
+        self.act_play.setIcon(icon)
+        self.act_play.setToolTip(tip)
+        self.act_play.setStatusTip(tip)
+        if self.btn_play is not None:
+            self.btn_play.setText(text)
+            self.btn_play.setIcon(icon)
+            self.btn_play.setToolTip(tip)
+
+    def prev_frame(self):
+        if self.reader:
+            self.slider.setValue(max(0, self.slider.value() - 1))
+
+    def next_frame(self):
+        if self.reader:
+            self.slider.setValue(min(self.slider.maximum(), self.slider.value() + 1))
 
     def _play_step(self):
         v = self.slider.value() + 1
@@ -1508,7 +1017,6 @@ class DesktopMainWindow(QMainWindow):
         if self.project.meta:
             self.project.meta.model_type = self.model_type.currentText()
             self.project.save_meta()
-        self._refresh_anns()
         self._seek(frame_id)
         self.status_box.setText(f"Saved annotation at frame {frame_id}")
 
@@ -1523,7 +1031,6 @@ class DesktopMainWindow(QMainWindow):
                 self.project.delete_annotation(a.annotation_id)
         for g in generated:
             self.project.upsert_annotation(g)
-        self._refresh_anns()
         self.status_box.setText(f"Interpolated {len(generated)} frames")
 
     def confirm_interp(self):
@@ -1536,210 +1043,8 @@ class DesktopMainWindow(QMainWindow):
                 if a.annotation_id:
                     self.project.delete_annotation(a.annotation_id)
                 self.project.upsert_annotation(c)
-                self._refresh_anns()
                 self.status_box.setText(f"Confirmed frame {frame_id}")
                 return
-
-    def _on_ann_clicked(self, item):
-        text = item.text()
-        if text.startswith("f"):
-            try:
-                fid = int(text.split()[0][1:])
-                self.slider.setValue(fid)
-            except ValueError:
-                pass
-
-    def build_dataset(self):
-        if not self.project:
-            QMessageBox.warning(self, "Dataset", "Create or open a project first")
-            return
-        if self._dataset_worker is not None and self._dataset_worker.isRunning():
-            QMessageBox.information(self, "Dataset", "Dataset build is already running")
-            return
-        anns = self.project.list_annotations(include_interpolated=True)
-        usable = [
-            a
-            for a in anns
-            if a.annotation_source != AnnotationSource.INTERPOLATED.value or a.quality_score >= 0.5
-        ]
-        has_auto = any(self.project.auto_labels_path(v.video_id) for v in (self.project.meta.videos if self.project.meta else []))
-        if not usable and not has_auto:
-            QMessageBox.warning(
-                self,
-                "Dataset",
-                "No labeled videos found.\n\n"
-                "Use Tools → Generate Satellite Video… (auto-labeled) first, then Build Dataset.",
-            )
-            return
-
-        if self.project.meta:
-            self.project.meta.model_type = self.model_type.currentText()
-            self.project.save_meta()
-
-        self.pause()
-        if self.btn_build:
-            self.btn_build.setEnabled(False)
-        self.status_box.setText("Building dataset in background…")
-        self.statusBar().showMessage("Building dataset…")
-
-        self._dataset_worker = DatasetWorker(
-            self.project.root,
-            model_type=self.model_type.currentText(),
-            every_n=self.every_n.value(),
-            augment_per_image=self.aug_n.value(),
-            class_name=self.project.meta.target_class if self.project.meta else "target_region",
-        )
-        self._set_task_progress("dataset", None, "Building dataset…")
-        self._dataset_worker.progress.connect(self.status_box.setText)
-        self._dataset_worker.finished_ok.connect(self._on_dataset_ok)
-        self._dataset_worker.failed.connect(self._on_dataset_failed)
-        self._dataset_worker.start()
-
-    def _on_dataset_ok(self, out: str):
-        self._set_task_progress("done", 100)
-        if self.btn_build:
-            self.btn_build.setEnabled(True)
-        self.statusBar().showMessage("Ready")
-        self.status_box.setText(f"Dataset built: {out}")
-        QMessageBox.information(self, "Dataset", f"Created:\n{out}")
-
-    def _on_dataset_failed(self, err: str):
-        self.task_progress.setRange(0, 100)
-        self.task_stage.setText("Failed / خطا")
-        if self.btn_build:
-            self.btn_build.setEnabled(True)
-        self.statusBar().showMessage("Ready")
-        self.status_box.setText(f"Dataset failed: {err}")
-        QMessageBox.critical(self, "Dataset", err)
-
-    def train_yolo(self):
-        if not self.project:
-            QMessageBox.warning(self, "Train", "Create or open a project first")
-            return
-        if self._train_worker is not None and self._train_worker.isRunning():
-            QMessageBox.information(self, "Train", "Training is already running")
-            return
-        datasets = sorted(self.project.datasets_dir.glob("*/data.yaml"))
-        if not datasets:
-            QMessageBox.warning(self, "Train", "Build a dataset first")
-            return
-        try:
-            import ultralytics  # noqa: F401
-        except ImportError:
-            QMessageBox.critical(
-                self,
-                "Train",
-                "ultralytics / torch are not installed in this environment.\n\n"
-                "Install with:\n"
-                "  pip install torch torchvision\n"
-                "  pip install ultralytics\n\n"
-                "Then restart the app.",
-            )
-            return
-
-        from desktop_app.pipeline.auto import resolve_device
-
-        device = resolve_device(self._device_value())
-        if device not in ("cpu", "mps"):
-            try:
-                import torch
-
-                if not torch.cuda.is_available():
-                    device = "cpu"
-                    self.status_box.setText("CUDA not available — using CPU")
-            except Exception:
-                device = "cpu"
-
-        runner = TrainingRunner(
-            datasets[-1],
-            self.project.runs_dir,
-            model_type=self.model_type.currentText(),
-            epochs=self.epochs.value(),
-            batch=self.batch.value(),
-            imgsz=self.imgsz.value(),
-            device=device,
-        )
-        self._train_worker = TrainWorker(runner)
-        self._train_worker.progress.connect(self._on_train_progress)
-        self._train_worker.finished_ok.connect(self._on_train_ok)
-        self._train_worker.failed.connect(self._on_train_failed)
-        if self.btn_train:
-            self.btn_train.setEnabled(False)
-        self._train_worker.start()
-        self.status_box.setText(f"Training started on {device}… (first run may download weights)")
-        self.statusBar().showMessage("Training…")
-
-    def _on_train_progress(self, d: dict):
-        if d.get("type") == "batch":
-            eta = d.get("eta_sec")
-            eta_s = f" — ETA {int(eta // 60)}m{int(eta % 60):02d}s" if eta else ""
-            self._set_task_progress(
-                "train", 100.0 * float(d.get("fraction", 0.0)), f"Epoch {d['epoch']}/{d['epochs']} batch {d['batch']}/{d['nb']}{eta_s}"
-            )
-        elif "status" in d:
-            self._set_task_progress("train", 0, d["status"])
-        else:
-            m = d.get("metrics", {})
-            key = next((k for k in m if "mAP50(" in k), None)
-            self.status_box.setText(f"Epoch {d.get('epoch')} done" + (f" — {key}={m[key]:.3f}" if key else ""))
-
-    def _on_train_ok(self, result: dict):
-        self._set_task_progress("done", 100)
-        if self.btn_train:
-            self.btn_train.setEnabled(True)
-        self.statusBar().showMessage("Ready")
-        self.status_box.setText(str(result)[:500])
-        QMessageBox.information(self, "Train", str(result))
-
-    def _on_train_failed(self, err: str):
-        self.task_progress.setRange(0, 100)
-        self.task_stage.setText("Failed / خطا")
-        if self.btn_train:
-            self.btn_train.setEnabled(True)
-        self.statusBar().showMessage("Ready")
-        self.status_box.setText(f"Training failed: {err}")
-        QMessageBox.critical(self, "Train", err)
-
-    def export_onnx(self):
-        if not self.project:
-            return
-        try:
-            import ultralytics  # noqa: F401
-        except ImportError:
-            QMessageBox.critical(self, "ONNX", "ultralytics is not installed. Train/export unavailable.")
-            return
-        weights = list(self.project.runs_dir.glob("**/weights/best.pt"))
-        if not weights:
-            QMessageBox.warning(self, "ONNX", "No best.pt found")
-            return
-        runner = TrainingRunner(self.project.datasets_dir / "x", self.project.runs_dir, imgsz=self.imgsz.value())
-        try:
-            out = runner.export_onnx(weights[-1], self.project.runs_dir / "model.onnx")
-            self.status_box.setText(f"ONNX: {out}")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "ONNX", str(exc))
-
-    def build_package(self):
-        if not self.project:
-            return
-        try:
-            zip_path = PackageBuilder(self.project).build()
-            size_mb = zip_path.stat().st_size / (1024 * 1024)
-            scp = f"scp {zip_path} user@JETSON_IP:/home/user/packages/"
-            self.status_box.setText(f"Package {zip_path.name} ({size_mb:.1f} MB)\n{scp}")
-            QMessageBox.information(self, "Package", f"{zip_path}\n{size_mb:.2f} MB\n\n{scp}")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Package", str(exc))
-
-    def validate_pkg(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Package ZIP", str(self.project.packages_dir if self.project else ""), "ZIP (*.zip)")
-        if not path:
-            return
-        try:
-            result = validate_package(path)
-            QMessageBox.information(self, "Validate", json.dumps(result, indent=2)[:2000])
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Validate", str(exc))
 
     def closeEvent(self, e):  # noqa: N802
         self.pause()
@@ -1774,6 +1079,9 @@ def main():
             from PyQt5.QtWidgets import QInputDialog as _QID
             qc.QInputDialog = _QID
     app = QApplication(sys.argv)
+    app.setApplicationName("سامانه تنگسیری")
+    app.setOrganizationName("GeoFinder")
+    apply_theme(app)
     win = DesktopMainWindow()
     win.show()
     return qt_exec(app)

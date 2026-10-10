@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+build/
+dist/
+*.spec
+tools/windows_desktop/geofinder.spec
 logs/*.log
 data/output/*
 !data/output/.gitkeep
@@ -17,3 +21,6 @@ models/*.engine
 *.mp4
 !data/input/sample.mp4
 .DS_Store
+
+# Offline map packages (large .mbtiles)
+data/offline_maps/*

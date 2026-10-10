@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -48,7 +49,7 @@ def _soft_gstreamer_pipeline(path: str) -> str:
 
 
 class VideoReader:
-    """Seekable video reader with GStreamer / OpenCV backends."""
+    """Seekable video reader with GStreamer / OpenCV backends (or live camera)."""
 
     def __init__(self, path: str, prefer_gstreamer: bool = True):
         self.path = str(Path(path).resolve())
@@ -59,9 +60,23 @@ class VideoReader:
         self.backend = "opencv"
         self.info: Optional[VideoInfo] = None
         self._current_index = -1
+        self._is_camera = False
         self._open(prefer_gstreamer)
 
-    def _try_open(self, source, api=cv2.CAP_ANY) -> bool:
+    @classmethod
+    def from_camera(cls, index: int = 0) -> "VideoReader":
+        """Open a connected webcam / capture device by index (0 = default)."""
+        obj = cls.__new__(cls)
+        obj.path = f"camera:{int(index)}"
+        obj._cap = None
+        obj.backend = "camera"
+        obj.info = None
+        obj._current_index = -1
+        obj._is_camera = True
+        obj._open_camera(int(index))
+        return obj
+
+    def _try_open(self, source, api=cv2.CAP_ANY, *, rewind: bool = True) -> bool:
         cap = cv2.VideoCapture(source, api)
         if not cap.isOpened():
             cap.release()
@@ -70,10 +85,43 @@ class VideoReader:
         if not ok or frame is None:
             cap.release()
             return False
-        # Rewind after probe
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if rewind:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self._cap = cap
         return True
+
+    def _open_camera(self, index: int) -> None:
+        apis: list[tuple[str, int]] = []
+        if sys.platform == "win32":
+            apis.append(("dshow", cv2.CAP_DSHOW))
+        apis.append(("any", cv2.CAP_ANY))
+        if sys.platform == "linux":
+            apis.append(("v4l2", getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)))
+
+        opened = False
+        for name, api in apis:
+            try:
+                if self._try_open(index, api, rewind=False):
+                    self.backend = f"camera-{name}"
+                    opened = True
+                    logger.info("Opened camera %s via %s", index, name)
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Camera open failed (%s index=%s): %s", name, index, exc)
+
+        if not opened:
+            raise RuntimeError(
+                f"Cannot open camera index {index} (not connected or in use by another app)"
+            )
+
+        assert self._cap is not None
+        width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+        fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps <= 1e-3:
+            fps = 30.0
+        self.info = VideoInfo(self.path, width, height, fps, 0, self.backend)
+        self._current_index = -1
 
     def _open(self, prefer_gstreamer: bool) -> None:
         opened = False

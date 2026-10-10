@@ -3,17 +3,28 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-# `python desktop_app/app.py` puts desktop_app/ first on sys.path, where our
-# desktop_app/packaging/ would shadow the PyPI `packaging` library that
-# ultralytics / torch import ("No module named 'packaging.version'").
-sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != HERE]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+FROZEN = bool(getattr(sys, "frozen", False)) and hasattr(sys, "_MEIPASS")
+
+if FROZEN:
+    ROOT = Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    APP_DIR = Path(sys.executable).resolve().parent
+    try:
+        os.chdir(APP_DIR)
+    except OSError:
+        pass
+else:
+    ROOT = HERE.parent
+    # `python desktop_app/app.py` puts desktop_app/ first on sys.path, where our
+    # desktop_app/packaging/ would shadow the PyPI `packaging` library that
+    # ultralytics / torch import ("No module named 'packaging.version'").
+    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != HERE]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
 
 from desktop_app.gui.main_window import main
 

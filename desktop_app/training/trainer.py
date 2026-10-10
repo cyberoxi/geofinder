@@ -20,22 +20,30 @@ class TrainingRunner:
         data_yaml: str | Path,
         project_runs_dir: str | Path,
         model_type: str = "segmentation",
-        base_model: str = "yolov8n-seg.pt",
+        base_model: Optional[str] = "yolov8n-seg.pt",
         epochs: int = 50,
         batch: int = 8,
         imgsz: int = 640,
         device: str = "0",
+        freeze: int = 0,
     ):
         self.data_yaml = Path(data_yaml)
         self.runs_dir = Path(project_runs_dir)
         self.model_type = model_type
-        self.base_model = base_model if model_type == "segmentation" or "seg" in base_model else (
-            base_model if model_type == "detection" else "yolov8n-seg.pt"
-        )
-        if model_type == "detection" and "seg" in self.base_model:
-            self.base_model = "yolov8n.pt"
-        if model_type == "segmentation" and "seg" not in self.base_model:
-            self.base_model = "yolov8n-seg.pt"
+        # An existing .pt file (e.g. a region-atlas base model) is fine-tuned as-is
+        self.custom_weights = bool(base_model) and Path(str(base_model)).suffix == ".pt" and Path(str(base_model)).is_file()
+        base_model = base_model or "yolov8n-seg.pt"
+        if self.custom_weights:
+            self.base_model = str(Path(str(base_model)).resolve())
+        else:
+            self.base_model = base_model if model_type == "segmentation" or "seg" in base_model else (
+                base_model if model_type == "detection" else "yolov8n-seg.pt"
+            )
+            if model_type == "detection" and "seg" in self.base_model:
+                self.base_model = "yolov8n.pt"
+            if model_type == "segmentation" and "seg" not in self.base_model:
+                self.base_model = "yolov8n-seg.pt"
+        self.freeze = max(0, int(freeze))
         self.epochs = epochs
         self.batch = batch
         self.imgsz = imgsz
@@ -66,6 +74,8 @@ class TrainingRunner:
             "device": self.device,
             "model_type": self.model_type,
         }
+        if self.freeze:
+            cfg["freeze"] = self.freeze
         save_yaml(cfg, self.runs_dir / "training_config.yaml")
 
         if progress_cb:
@@ -83,7 +93,10 @@ class TrainingRunner:
             except Exception:
                 device = "cpu"
 
-        model = YOLO(self.base_model)
+        from shared.runtime_paths import find_bundled_file
+
+        weights = Path(self.base_model) if self.custom_weights else (find_bundled_file(self.base_model) or Path(self.base_model))
+        model = YOLO(str(weights))
 
         def on_fit_epoch_end(trainer):  # noqa: ANN001
             metrics = {}
@@ -140,6 +153,7 @@ class TrainingRunner:
         if progress_cb:
             progress_cb({"epoch": 0, "metrics": {}, "status": f"Training on {device}…"})
 
+        extra: Dict[str, Any] = {"freeze": self.freeze} if self.freeze else {}
         results = model.train(
             data=str(self.data_yaml),
             epochs=self.epochs,
@@ -149,6 +163,7 @@ class TrainingRunner:
             project=str(self.runs_dir),
             name="train",
             exist_ok=True,
+            **extra,
         )
         _ = results
         best = self.runs_dir / "train" / "weights" / "best.pt"
@@ -159,6 +174,15 @@ class TrainingRunner:
             "last_metrics": self.last_metrics,
             "results_dir": str(self.runs_dir / "train"),
             "device": device,
+            "settings": {
+                "epochs": self.epochs,
+                "batch": self.batch,
+                "imgsz": self.imgsz,
+                "device": device,
+                "model": self.base_model,
+                "model_type": self.model_type,
+                "data": str(self.data_yaml),
+            },
         }
         (self.runs_dir / "train_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
         return summary

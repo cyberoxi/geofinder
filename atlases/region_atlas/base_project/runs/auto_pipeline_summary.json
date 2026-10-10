@@ -1,0 +1,78 @@
+{
+  "config": {
+    "model_type": "segmentation",
+    "epochs": 60,
+    "batch": 4,
+    "imgsz": 640,
+    "device": "0",
+    "augment_per_image": 1,
+    "auto_every_n": 3,
+    "export_onnx": false,
+    "build_package": false,
+    "evaluate": false,
+    "base_model": null,
+    "freeze": 0
+  },
+  "device": "0",
+  "dataset": {
+    "path": "E:\\Projects\\geofinder\\atlases\\region_atlas\\base_project\\datasets\\dataset_v1",
+    "split_map": {
+      "c28fa0fb0217": "train",
+      "9c7754fea4c5": "train",
+      "d3a8c139b0b5": "val",
+      "9b5ecc9ebf39": "test"
+    },
+    "counts": {
+      "train": 4,
+      "val": 64,
+      "test": 1
+    },
+    "negatives": {
+      "train": 1,
+      "val": 0,
+      "test": 1
+    },
+    "classes": [
+      "target_region",
+      "landmark_1_water",
+      "landmark_2_building",
+      "landmark_3_sports_field",
+      "landmark_4_building",
+      "landmark_5_water",
+      "landmark_6_water",
+      "landmark_7_building",
+      "landmark_8_water",
+      "landmark_9_building",
+      "landmark_10_building"
+    ]
+  },
+  "train": {
+    "best_weights": "E:\\Projects\\geofinder\\atlases\\region_atlas\\base_project\\runs\\train\\weights\\best.pt",
+    "last_metrics": {
+      "epoch": 61,
+      "metrics": {
+        "metrics/precision(B)": 0.0,
+        "metrics/recall(B)": 0.0,
+        "metrics/mAP50(B)": 0.0,
+        "metrics/mAP50-95(B)": 0.0,
+        "metrics/precision(M)": 0.0,
+        "metrics/recall(M)": 0.0,
+        "metrics/mAP50(M)": 0.0,
+        "metrics/mAP50-95(M)": 0.0
+      },
+      "stopped": false
+    },
+    "results_dir": "E:\\Projects\\geofinder\\atlases\\region_atlas\\base_project\\runs\\train",
+    "device": "0",
+    "settings": {
+      "epochs": 60,
+      "batch": 4,
+      "imgsz": 640,
+      "device": "0",
+      "model": "E:\\Projects\\geofinder\\yolov8n-seg.pt",
+      "model_type": "segmentation",
+      "data": "E:\\Projects\\geofinder\\atlases\\region_atlas\\base_project\\datasets\\dataset_v1\\data.yaml"
+    }
+  },
+  "elapsed_sec": 136.5
+}

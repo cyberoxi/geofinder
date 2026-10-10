@@ -73,6 +73,19 @@ DEFAULT_RUNTIME = {
         "trail_length": 60,
         "video_codec": "mp4v",
     },
+    # Jetson UART: pixel offset from image centre to target centre (+x right, +y down)
+    "serial": {
+        "enabled": False,
+        "port": "/dev/ttyTHS1",
+        "baudrate": 115200,
+        "bytesize": 8,
+        "parity": "N",
+        "stopbits": 1,
+        "timeout": 0.1,
+        "write_every_n": 1,
+        "send_when_lost": False,
+        "line_format": "{dx},{dy}\n",
+    },
 }
 
 

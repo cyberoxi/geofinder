@@ -1,0 +1,8 @@
+batch: 4
+data: E:\Projects\geofinder\atlases\region_atlas\subregions\target_1\datasets\dataset_v1\data.yaml
+device: '0'
+epochs: 15
+freeze: 10
+imgsz: 640
+model: E:\Projects\geofinder\atlases\region_atlas\base_model\best.pt
+model_type: segmentation

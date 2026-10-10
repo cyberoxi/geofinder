@@ -54,6 +54,33 @@ def selection_rect_px(
     return x0, y0, x1, y1
 
 
+def selection_polygon_px(
+    lonlat: Sequence[Sequence[float]],
+    fetch_bbox: Tuple[float, float, float, float],
+    zoom: int,
+    mosaic_shape: Tuple[int, ...],
+) -> List[List[float]]:
+    """Map a lon/lat ring ``[(lon, lat), ...]`` into mosaic pixels (clamped)."""
+    H, W = mosaic_shape[:2]
+    pts: List[List[float]] = []
+    for lon, lat in lonlat:
+        x, y = geo_to_mosaic_px(float(lat), float(lon), fetch_bbox, zoom)
+        pts.append([float(np.clip(x, 0, W)), float(np.clip(y, 0, H))])
+    if len(pts) < 3:
+        raise ValueError("Polygon needs at least 3 vertices")
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if max(xs) - min(xs) < 4 or max(ys) - min(ys) < 4:
+        raise ValueError("Selected region is too small at this download zoom")
+    return pts
+
+
+def polygon_bbox_px(poly: Sequence[Sequence[float]]) -> Rect:
+    xs = [float(p[0]) for p in poly]
+    ys = [float(p[1]) for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def meters_per_pixel(lat: float, zoom: int) -> float:
     return 156543.03392 * math.cos(math.radians(lat)) / (2.0**zoom)
 
@@ -239,6 +266,7 @@ def build_scene(
     mosaic: np.ndarray,
     target: Rect,
     *,
+    target_polygon: Optional[Sequence[Sequence[float]]] = None,
     num_landmarks: int = 8,
     target_class: str = "target_region",
     meters_per_px: float = 0.0,
@@ -249,6 +277,9 @@ def build_scene(
     Detect real landmark objects around the target and pick ``num_landmarks`` of
     them (near / mid / far).  Returns (layout, all_candidates) — the candidates
     feed the landmark editor so the user can swap, add or remove landmarks.
+
+    ``target`` is the axis-aligned bbox used for search; ``target_polygon`` (if
+    given) becomes the exact labeled target shape in mosaic pixels.
     """
     from desktop_app.satellite.objects import ObjectCandidate, propose_objects, select_landmarks
 
@@ -274,8 +305,11 @@ def build_scene(
             selected.append(c)
             candidates.append(c)
             taken.append(r)
+    poly = [list(map(float, p)) for p in target_polygon] if target_polygon is not None else _rect_poly(target)
+    if len(poly) < 3:
+        poly = _rect_poly(target)
     layout = layout_from_selection(
-        _rect_poly(target),
+        poly,
         selected,
         (W, H),
         target_class=target_class,

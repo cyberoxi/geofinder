@@ -23,8 +23,11 @@ from gui.qt_compat import (
     QVBoxLayout,
     QWidget,
     QSpinBox,
+    QSize,
     qt_exec,
 )
+from shared.icons import get_icon
+from shared.theme import style_brand_label
 
 from core.config import deep_update, save_config
 from core.logger import get_logger
@@ -44,7 +47,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.setWindowTitle(
-            f"{config.get('app', {}).get('name', 'Ground Region Tracker')} "
+            f"{config.get('app', {}).get('name', 'سامانه تنگسیری')} "
             f"v{config.get('app', {}).get('version', '1.0.0')}"
         )
         gui_cfg = config.get("gui", {})
@@ -124,29 +127,51 @@ class MainWindow(QMainWindow):
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main")
+        tb.setObjectName("mainToolBar")
         tb.setMovable(False)
+        tb.setIconSize(QSize(22, 22))
+        tb.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         self.addToolBar(tb)
-        tb.addAction(self._act("Open", self.open_video))
-        tb.addAction(self._act("Play", self.play))
-        tb.addAction(self._act("Pause", self.pause))
-        tb.addAction(self._act("Stop", self.stop_playback))
-        tb.addAction(self._act("Prev", self.prev_frame))
-        tb.addAction(self._act("Next", self.next_frame))
-        tb.addSeparator()
-        tb.addAction(self._act("Rect ROI", lambda: self.video_widget.set_selection_mode("rectangle")))
-        tb.addAction(self._act("Poly ROI", lambda: self.video_widget.set_selection_mode("polygon")))
-        tb.addAction(self._act("Confirm ROI", self.confirm_roi))
-        tb.addAction(self._act("Reset Track", self.reset_tracking))
-        tb.addSeparator()
-        tb.addAction(self._act("Run", self.start_processing))
-        tb.addAction(self._act("Stop Proc", self.stop_processing))
-        tb.addAction(self._act("Export Video", self.export_results_hint))
 
-    def _act(self, text, slot, shortcut=None) -> QAction:
-        action = QAction(text, self)
+        brand = QLabel()
+        style_brand_label(brand)
+        tb.addWidget(brand)
+        tb.addSeparator()
+
+        items = [
+            ("Open", "open", self.open_video, "Open video file"),
+            ("Play", "play", self.play, "Play"),
+            ("Pause", "pause", self.pause, "Pause"),
+            ("Stop", "stop", self.stop_playback, "Stop and rewind to start"),
+            ("Prev", "prev", self.prev_frame, "Previous frame"),
+            ("Next", "next", self.next_frame, "Next frame"),
+            None,
+            ("Rect ROI", "rect", lambda: self.video_widget.set_selection_mode("rectangle"), "Rectangle ROI"),
+            ("Poly ROI", "poly", lambda: self.video_widget.set_selection_mode("polygon"), "Polygon ROI"),
+            ("Confirm", "confirm", self.confirm_roi, "Confirm ROI"),
+            ("Reset", "reset", self.reset_tracking, "Reset tracking"),
+            None,
+            ("Run", "run", self.start_processing, "Start processing"),
+            ("Stop Proc", "stop_proc", self.stop_processing, "Stop processing"),
+            ("Export", "export", self.export_results_hint, "Export results location"),
+            ("Settings", "settings", self.open_settings, "Open settings"),
+        ]
+        for item in items:
+            if item is None:
+                tb.addSeparator()
+                continue
+            text, icon_name, slot, tip = item
+            act = self._act(text, slot, icon_name=icon_name, tip=tip)
+            tb.addAction(act)
+
+    def _act(self, text, slot, shortcut=None, icon_name=None, tip=None) -> QAction:
+        action = QAction(get_icon(icon_name), text, self) if icon_name else QAction(text, self)
         action.triggered.connect(slot)
         if shortcut:
             action.setShortcut(shortcut)
+        if tip:
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
         return action
 
     # --- Video I/O ---

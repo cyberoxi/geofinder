@@ -10,6 +10,11 @@ from jetson_runtime.detectors.yolo_detector import YOLODetector
 from jetson_runtime.exporters.result_exporter import ResultExporter, draw_overlay
 from jetson_runtime.package_loader.loader import PackageLoader
 from jetson_runtime.runtime.hybrid_tracker import MultiScaleHybridTracker
+from jetson_runtime.serial_out import (
+    SerialOffsetSender,
+    image_to_target_offset,
+    merge_serial_config,
+)
 from shared.logging import get_logger, setup_logging
 from shared.schemas import ROI, RuntimeState
 from shared.video_reader import VideoReader
@@ -118,6 +123,7 @@ def run_runtime(
     stop_flag: Optional[Callable[[], bool]] = None,
     initial_roi: Optional[ROI] = None,
     end_frame: int = -1,
+    serial_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     setup_logging()
     loader = PackageLoader(package_path)
@@ -139,8 +145,13 @@ def run_runtime(
     if loader.runtime_config.get("export", {}).get("save_annotated_video", True):
         exporter.start_video(None, source.info.width, source.info.height, source.info.fps)
 
+    serial_cfg = merge_serial_config(loader.runtime_config.get("serial"), serial_override)
+    serial = SerialOffsetSender(serial_cfg)
+    serial.open()
+
     ok, frame = source.seek(0)
     if not ok or frame is None:
+        serial.close()
         source.release()
         raise RuntimeError("Cannot read video")
 
@@ -171,40 +182,57 @@ def run_runtime(
     t0 = time.perf_counter()
     idx = 0
     last = end_frame if end_frame >= 0 else (source.info.frame_count - 1 if source.info.frame_count > 0 else 10**9)
+    tracking_ok = {RuntimeState.TRACKING, RuntimeState.SCALE_CHANGE}
 
-    while True:
-        if stop_flag and stop_flag():
-            break
-        if idx > last:
-            break
-        t_frame = time.perf_counter()
-        state = tracker.update(frame, frame_idx=idx)
-        dt = time.perf_counter() - t_frame
-        fps = 1.0 / dt if dt > 0 else 0.0
-        fps_list.append(fps)
-        result = tracker.to_frame_result(idx, source.reader.timestamp_of(idx), process_fps=fps)
-        exporter.add_result(result)
-        annotated = draw_overlay(frame, result, trail=state.trail)
-        if yolo is not None and yolo.predict_count != last_predict:
-            draw_landmarks(annotated, yolo)
-            last_predict = yolo.predict_count
-        exporter.write_frame(annotated)
-        if state.status == RuntimeState.LOST and loader.runtime_config.get("export", {}).get("save_failed_frames", True):
-            exporter.save_failed_frame(frame, idx)
-        processed += 1
-        if progress_cb:
-            progress_cb(processed, max(1, last + 1), result.to_dict())
-        if frame_cb:
-            frame_cb(annotated, result.to_dict())
+    try:
+        while True:
+            if stop_flag and stop_flag():
+                break
+            if idx > last:
+                break
+            t_frame = time.perf_counter()
+            state = tracker.update(frame, frame_idx=idx)
+            dt = time.perf_counter() - t_frame
+            fps = 1.0 / dt if dt > 0 else 0.0
+            fps_list.append(fps)
+            result = tracker.to_frame_result(idx, source.reader.timestamp_of(idx), process_fps=fps)
+            exporter.add_result(result)
 
-        step = 1 + max(0, int(getattr(tracker, "skip_frames", 0)))
-        next_idx = idx + step
-        if next_idx > last:
-            break
-        ok, frame = source.seek(next_idx)
-        idx = next_idx
-        if not ok or frame is None:
-            break
+            fh, fw = frame.shape[:2]
+            info = result.to_dict()
+            if state.roi is not None:
+                dx, dy, dist = image_to_target_offset(fw, fh, result.center_x, result.center_y)
+            else:
+                dx, dy, dist = 0.0, 0.0, 0.0
+            info["offset_dx"] = dx
+            info["offset_dy"] = dy
+            info["offset_dist"] = dist
+            is_tracking = state.status in tracking_ok and state.roi is not None
+            serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
+
+            annotated = draw_overlay(frame, result, trail=state.trail)
+            if yolo is not None and yolo.predict_count != last_predict:
+                draw_landmarks(annotated, yolo)
+                last_predict = yolo.predict_count
+            exporter.write_frame(annotated)
+            if state.status == RuntimeState.LOST and loader.runtime_config.get("export", {}).get("save_failed_frames", True):
+                exporter.save_failed_frame(frame, idx)
+            processed += 1
+            if progress_cb:
+                progress_cb(processed, max(1, last + 1), info)
+            if frame_cb:
+                frame_cb(annotated, info)
+
+            step = 1 + max(0, int(getattr(tracker, "skip_frames", 0)))
+            next_idx = idx + step
+            if next_idx > last:
+                break
+            ok, frame = source.seek(next_idx)
+            idx = next_idx
+            if not ok or frame is None:
+                break
+    finally:
+        serial.close()
 
     elapsed = time.perf_counter() - t0
     tracker.state.status = RuntimeState.COMPLETED
@@ -216,6 +244,7 @@ def run_runtime(
         "min_fps": min(fps_list) if fps_list else 0.0,
         "yolo": yolo.get_info() if yolo else {"available": False},
         "package": loader.manifest.to_dict() if loader.manifest else {},
+        "serial": {k: serial_cfg[k] for k in ("enabled", "port", "baudrate") if k in serial_cfg},
     }
     paths = exporter.finalize(loader.runtime_config, stats, video_path=video_path)
     source.release()

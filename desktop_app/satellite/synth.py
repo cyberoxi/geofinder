@@ -249,17 +249,33 @@ def zoom_path(
     angle: float = 0.0,
     angle_drift: float = 0.0,
     end_view_factor: float = 1.6,
+    start_view_factor: Optional[float] = None,
     start_offset: float = 0.0,
     end_jitter: float = 0.0,
 ) -> List[Pose]:
-    """Zoom from the widest possible view down to ``end_view_factor`` × target size."""
+    """
+    Zoom between view heights expressed as multiples of ``target_size``.
+
+    If ``start_view_factor`` is None, start at the widest in-mosaic view.
+    Larger factor = more zoomed out.  start/end are swapped if needed so the
+    path still covers the requested range (zoom-in or zoom-out).
+    """
     tcx, tcy = target_center
-    end_h = max(16.0, target_size * end_view_factor)
+    max_h = cam.max_view_h(tcx, tcy, angle)
+    end_h = max(16.0, target_size * float(end_view_factor))
+    if start_view_factor is None:
+        start_h = max_h
+    else:
+        start_h = max(16.0, target_size * float(start_view_factor))
+    start_h = min(start_h, max_h)
+    end_h = min(end_h, max_h)
+    # Keep a tiny gap so log-space interpolation is stable
+    if abs(math.log(max(start_h, 1e-3)) - math.log(max(end_h, 1e-3))) < 1e-6:
+        end_h = max(16.0, start_h * 0.85)
     end_c = (
         tcx + rng.uniform(-1, 1) * end_jitter * end_h,
         tcy + rng.uniform(-1, 1) * end_jitter * end_h,
     )
-    start_h = cam.max_view_h(tcx, tcy, angle)
     start_c = (
         tcx + rng.uniform(-1, 1) * start_offset * start_h,
         tcy + rng.uniform(-1, 1) * start_offset * start_h,
@@ -443,3 +459,121 @@ def plan_variants(n_videos: int, seed: int = 0, night_fraction: float = 0.0, ir_
     for j in others[n_night : n_night + n_ir]:
         plans[j]["light"] = "ir"
     return plans
+
+
+# ---------------------------------------------------------------- user-designed camera paths
+
+
+@dataclass
+class CameraKey:
+    """Keyframe of a designed camera path (mosaic px / degrees / seconds)."""
+
+    cx: float
+    cy: float
+    view_h: float  # mosaic px covered by the frame height (smaller = more zoomed in)
+    angle: float = 0.0
+    duration: float = 2.0  # seconds to travel from the previous keyframe (ignored for the first)
+
+    def to_dict(self) -> Dict:
+        return {k: round(float(getattr(self, k)), 3) for k in ("cx", "cy", "view_h", "angle", "duration")}
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "CameraKey":
+        return cls(**{k: float(d[k]) for k in ("cx", "cy", "view_h", "angle", "duration") if k in d})
+
+
+def _catmull(p0, p1, p2, p3, t):
+    t2, t3 = t * t, t * t * t
+    return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+
+
+def path_from_keyframes(keys: Sequence[CameraKey], fps: float, smooth: bool = True, ease: bool = True) -> List[Pose]:
+    """Poses for every frame: smooth (Catmull-Rom) position, log-space zoom, unwrapped rotation."""
+    if not keys:
+        return []
+    if len(keys) == 1:
+        k = keys[0]
+        return [Pose(k.cx, k.cy, k.view_h, k.angle)] * max(1, int(round(max(k.duration, 1.0) * fps)))
+    # unwrap angles so a turn from 170° to -170° goes the short way
+    angles = [keys[0].angle]
+    for k in keys[1:]:
+        d = (k.angle - angles[-1] + 180.0) % 360.0 - 180.0
+        angles.append(angles[-1] + d)
+    pts = np.array([[k.cx, k.cy] for k in keys], np.float64)
+    logs = np.log([max(4.0, k.view_h) for k in keys])
+    poses: List[Pose] = []
+    for i in range(1, len(keys)):
+        n = max(1, int(round(max(0.05, keys[i].duration) * fps)))
+        p0 = pts[max(0, i - 2)]
+        p1, p2 = pts[i - 1], pts[i]
+        p3 = pts[min(len(keys) - 1, i + 1)]
+        for j in range(n):
+            u = j / n
+            e = _ease_in_out(u) if ease else u
+            if smooth:
+                c = _catmull(p0, p1, p2, p3, e)
+            else:
+                c = p1 + (p2 - p1) * e
+            vh = float(np.exp(logs[i - 1] + (logs[i] - logs[i - 1]) * e))
+            ang = angles[i - 1] + (angles[i] - angles[i - 1]) * e
+            poses.append(Pose(float(c[0]), float(c[1]), vh, float(ang)))
+    last = keys[-1]
+    poses.append(Pose(last.cx, last.cy, last.view_h, angles[-1]))
+    return poses
+
+
+def preset_keys(
+    name: str,
+    target_center: Tuple[float, float],
+    target_size: float,
+    max_view: float,
+    angle: float = 0.0,
+) -> List[CameraKey]:
+    """Ready-made editable paths: zoom_in, zoom_out, orbit, flyover, spiral."""
+    tx, ty = target_center
+    far = max_view * 0.95
+    near = max(16.0, target_size * 1.6)
+    mid = math.sqrt(far * near)
+    if name == "zoom_in":
+        return [CameraKey(tx, ty, far, angle, 0), CameraKey(tx, ty, mid, angle, 3), CameraKey(tx, ty, near, angle, 3)]
+    if name == "zoom_out":
+        return [CameraKey(tx, ty, near, angle, 0), CameraKey(tx, ty, mid, angle, 3), CameraKey(tx, ty, far, angle, 3)]
+    if name == "orbit":
+        # frame must fit inside the map at any heading: diagonal ≈ 2.05 × view_h for 16:9
+        vh = min(max(near * 2.0, target_size * 4.0), max_view * 0.4)
+        r = min(target_size * 2.0, max(0.0, (max_view * 0.95 - vh * 2.05) / 2.0))
+        return [
+            CameraKey(tx + r * math.cos(a), ty + r * math.sin(a), vh, angle + math.degrees(a) + 90, 0 if k == 0 else 1.5)
+            for k, a in enumerate(np.linspace(0, 2 * math.pi, 9))
+        ]
+    if name == "flyover":
+        vh = min(max(near * 2.5, target_size * 3.5), max_view * 0.4)
+        d = min(target_size * 8, max(0.0, (max_view * 0.95 - vh * 2.05) / 2.0))
+        a = math.radians(angle)
+        dx, dy = math.cos(a) * d, math.sin(a) * d
+        return [CameraKey(tx - dx, ty - dy, vh, angle, 0), CameraKey(tx, ty, vh, angle, 3), CameraKey(tx + dx, ty + dy, vh, angle, 3)]
+    if name == "spiral":
+        keys = []
+        n = 8
+        for k in range(n + 1):
+            f = k / n
+            vh = math.exp(math.log(far) + (math.log(near) - math.log(far)) * f)
+            r = vh * 0.3 * (1 - f)
+            a = 2 * math.pi * f * 1.5
+            keys.append(CameraKey(tx + r * math.cos(a), ty + r * math.sin(a), vh, angle + 45 * f * 4, 0 if k == 0 else 1.0))
+        return keys
+    raise ValueError(f"Unknown preset {name!r}")
+
+
+def frame_corners(pose: Pose, aspect: float) -> np.ndarray:
+    """Corners (4,2) of the camera frame footprint on the mosaic (for drawing)."""
+    hw, hh = pose.view_h * aspect / 2.0, pose.view_h / 2.0
+    a = math.radians(pose.angle)
+    # frame x axis in mosaic coords (inverse of MosaicCamera.matrix rotation)
+    # MosaicCamera.matrix uses R = [[c, s], [-s, c]]; frame axes in mosaic = columns of R^T
+    ux, uy = math.cos(a), math.sin(a)
+    vx, vy = -math.sin(a), math.cos(a)
+    return np.array(
+        [[pose.cx + sx * hw * ux + sy * hh * vx, pose.cy + sx * hw * uy + sy * hh * vy] for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))],
+        np.float32,
+    )

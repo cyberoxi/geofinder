@@ -112,9 +112,10 @@ class ControlsPanel(QWidget):
         status_box = QGroupBox("Status")
         sform = QVBoxLayout(status_box)
         self.status_label = QLabel("READY")
-        self.status_label.setStyleSheet("font-weight: bold; color: gray; font-size: 16px;")
+        self.status_label.setStyleSheet("font-weight: 700; color: #94a3b8; font-size: 16px;")
         self.info_label = QLabel("—")
         self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color:#cbd5e1;")
         sform.addWidget(self.status_label)
         sform.addWidget(self.info_label)
         layout.addWidget(status_box)
@@ -172,17 +173,17 @@ class ControlsPanel(QWidget):
 
     def set_status(self, status: str, detail: str = "") -> None:
         colors = {
-            "READY": "gray",
-            "INITIALIZING": "orange",
-            "TRACKING": "limegreen",
-            "RE-DETECTING": "gold",
-            "LOST": "red",
-            "COMPLETED": "deepskyblue",
-            "ERROR": "crimson",
+            "READY": "#94a3b8",
+            "INITIALIZING": "#f59e0b",
+            "TRACKING": "#22c55e",
+            "RE-DETECTING": "#eab308",
+            "LOST": "#ef4444",
+            "COMPLETED": "#38bdf8",
+            "ERROR": "#f87171",
         }
         self.status_label.setText(status)
         self.status_label.setStyleSheet(
-            f"font-weight: bold; color: {colors.get(status, 'white')}; font-size: 16px;"
+            f"font-weight: 700; color: {colors.get(status, '#e2e8f0')}; font-size: 16px;"
         )
         if detail:
             self.info_label.setText(detail)

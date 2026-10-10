@@ -1,7 +1,7 @@
 # Ground Region Tracker — default configuration for Jetson Orin Nano
 
 app:
-  name: "Ground Region Tracker"
+  name: "سامانه تنگسیری"
   version: "1.0.0"
   language: "en"  # en | fa
   headless: false

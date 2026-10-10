@@ -283,10 +283,14 @@ _SAM_CACHE: Dict[str, object] = {}
 def sam_available(weights: str = "FastSAM-s.pt") -> bool:
     from pathlib import Path as _P
 
+    from shared.runtime_paths import find_bundled_file
+
     try:
         import ultralytics  # noqa: F401
     except ImportError:
         return False
+    if find_bundled_file(weights) is not None:
+        return True
     return _P(weights).exists() or (_P(__file__).resolve().parents[2] / weights).exists()
 
 
@@ -302,9 +306,10 @@ def _sam_proposals(
     """Segment-everything (FastSAM) on overlapping tiles → real object outlines."""
     from pathlib import Path as _P
 
+    from shared.runtime_paths import find_bundled_file
     from ultralytics import FastSAM
 
-    w = _P(weights)
+    w = find_bundled_file(weights) or _P(weights)
     if not w.exists():
         w = _P(__file__).resolve().parents[2] / weights
     key = str(w)
@@ -483,8 +488,13 @@ def propose_objects(
     include_intersections: bool = False,
     use_sam: bool = True,
     sam_weights: str = "FastSAM-s.pt",
+    distance_visibility: bool = True,
 ) -> List[ObjectCandidate]:
-    """All plausible landmark objects around the target, scored (best first)."""
+    """All plausible landmark objects around the target, scored (best first).
+
+    ``distance_visibility=False`` skips the size-vs-distance-to-target rule (used when
+    scanning a whole area without a real target, e.g. region atlas chunks).
+    """
     H, W = mosaic.shape[:2]
     ds = min(1.0, work_max / float(max(W, H)))
     small = cv2.resize(mosaic, (max(1, int(W * ds)), max(1, int(H * ds))), interpolation=cv2.INTER_AREA) if ds < 1 else mosaic
@@ -521,7 +531,7 @@ def propose_objects(
         c.distance = float(np.linalg.norm(c.center - tc))
         # Visibility rule: when the view is wide enough to include both the
         # target and this object, the object must still be >= ~14 px in a 720p frame.
-        if c.size < 0.035 * c.distance:
+        if distance_visibility and c.size < 0.035 * c.distance:
             continue
         kept.append(c)
     if not kept:

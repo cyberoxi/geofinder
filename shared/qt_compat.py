@@ -13,19 +13,25 @@ try:
         QTimer,
         QMutex,
         QMutexLocker,
+        QSettings,
         QSize,
         QPoint,
         QPointF,
     )
     from PySide6.QtGui import (  # noqa: F401
         QAction,
+        QIcon,
         QImage,
         QPixmap,
         QPainter,
         QPen,
         QColor,
+        QFont,
+        QFontDatabase,
         QMouseEvent,
         QKeySequence,
+        QPalette,
+        QPolygonF,
     )
     from PySide6.QtWidgets import (  # noqa: F401
         QApplication,
@@ -36,6 +42,7 @@ try:
         QHBoxLayout,
         QSplitter,
         QToolBar,
+        QToolButton,
         QStatusBar,
         QFileDialog,
         QMessageBox,
@@ -53,8 +60,14 @@ try:
         QPushButton,
         QSizePolicy,
         QListWidget,
+        QListWidgetItem,
         QInputDialog,
         QProgressBar,
+        QPlainTextEdit,
+        QFrame,
+        QScrollArea,
+        QGridLayout,
+        QStackedWidget,
     )
 
     QT_API = "PySide6"
@@ -73,6 +86,7 @@ except ImportError:  # pragma: no cover
         QTimer,
         QMutex,
         QMutexLocker,
+        QSettings,
         QSize,
         QPoint,
         QPointF,
@@ -80,13 +94,18 @@ except ImportError:  # pragma: no cover
     from PyQt5.QtCore import pyqtSignal as Signal  # type: ignore
     from PyQt5.QtCore import pyqtSlot as Slot  # type: ignore
     from PyQt5.QtGui import (  # type: ignore  # noqa: F401
+        QIcon,
         QImage,
         QPixmap,
         QPainter,
         QPen,
         QColor,
+        QFont,
+        QFontDatabase,
         QMouseEvent,
         QKeySequence,
+        QPalette,
+        QPolygonF,
     )
     from PyQt5.QtWidgets import (  # type: ignore  # noqa: F401
         QApplication,
@@ -97,6 +116,7 @@ except ImportError:  # pragma: no cover
         QHBoxLayout,
         QSplitter,
         QToolBar,
+        QToolButton,
         QStatusBar,
         QFileDialog,
         QMessageBox,
@@ -115,8 +135,14 @@ except ImportError:  # pragma: no cover
         QSizePolicy,
         QAction,
         QListWidget,
+        QListWidgetItem,
         QInputDialog,
         QProgressBar,
+        QPlainTextEdit,
+        QFrame,
+        QScrollArea,
+        QGridLayout,
+        QStackedWidget,
     )
 
     QT_API = "PyQt5"

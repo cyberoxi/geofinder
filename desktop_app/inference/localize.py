@@ -7,6 +7,7 @@ score it automatically on held-out auto-labeled videos.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +27,27 @@ TARGET_COLOR = (0, 220, 0)
 INFERRED_COLOR = (255, 0, 255)
 LANDMARK_COLOR = (0, 160, 255)
 GT_COLOR = (255, 255, 255)
+CENTER_COLOR = (80, 200, 255)
+
+
+def target_center_offset(polygon: Optional[np.ndarray], frame_shape) -> Optional[Dict[str, Any]]:
+    """Pixel offset of the target centroid from the image center."""
+    if polygon is None or len(polygon) < 1:
+        return None
+    h, w = frame_shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+    tc = np.asarray(polygon, np.float32).reshape(-1, 2).mean(axis=0)
+    dx = float(tc[0] - cx)
+    dy = float(tc[1] - cy)
+    return {
+        "dx": dx,
+        "dy": dy,
+        "distance_px": float(math.hypot(dx, dy)),
+        "angle_deg": float(math.degrees(math.atan2(dy, dx))),
+        "target_xy": (float(tc[0]), float(tc[1])),
+        "center_xy": (cx, cy),
+        "in_frame": bool(0 <= tc[0] < w and 0 <= tc[1] < h),
+    }
 
 
 def _detections_from_result(r0: Any, frame_shape) -> List[Detection]:
@@ -64,40 +86,104 @@ def localize_frame(
     """Decide the target polygon for one frame: direct detection first, landmarks second."""
     targets = [d for d in dets if d.class_id == 0]
     best = max(targets, key=lambda d: d.confidence) if targets else None
-    est = localizer.estimate(dets, frame_shape) if localizer is not None else None
+    # Prefer landmark-only transform when target is absent so off-screen location still works.
+    est = None
+    if localizer is not None:
+        est = localizer.estimate(dets, frame_shape, include_target=best is not None)
+
     if best is not None and best.confidence >= target_conf:
-        return {"polygon": _det_polygon(best), "source": "yolo", "confidence": best.confidence, "estimate": est}
-    if est is not None:
-        return {"polygon": est.polygon, "source": "landmarks", "confidence": est.confidence, "estimate": est}
-    if best is not None:
-        return {"polygon": _det_polygon(best), "source": "yolo_low", "confidence": best.confidence, "estimate": None}
-    return {"polygon": None, "source": "none", "confidence": 0.0, "estimate": None}
+        poly = _det_polygon(best)
+        source, conf = "yolo", best.confidence
+    elif est is not None:
+        poly = est.polygon
+        source, conf = "landmarks", est.confidence
+    elif best is not None:
+        poly = _det_polygon(best)
+        source, conf = "yolo_low", best.confidence
+    else:
+        poly, source, conf = None, "none", 0.0
+
+    offset = target_center_offset(poly, frame_shape)
+    landmarks_used = (
+        list(est.landmarks_used) if est is not None and source == "landmarks" else []
+    )
+    return {
+        "polygon": poly,
+        "source": source,
+        "confidence": float(conf),
+        "estimate": est,
+        "offset": offset,
+        "landmarks_used": landmarks_used,
+    }
+
+
+def _put_outlined(img: np.ndarray, text: str, org: tuple, color, scale: float = 0.7, thickness: int = 2):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
 def draw_localization(frame: np.ndarray, dets: List[Detection], loc: Dict[str, Any], names: List[str]) -> np.ndarray:
     img = frame.copy()
+    h, w = img.shape[:2]
+    center = (int(w / 2), int(h / 2))
+    cv2.drawMarker(img, center, CENTER_COLOR, cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA)
+    cv2.circle(img, center, 10, CENTER_COLOR, 1, cv2.LINE_AA)
+
     for d in dets:
         if d.class_id == 0:
             continue
-        x, y, w, h = map(int, d.bbox)
-        cv2.rectangle(img, (x, y), (x + w, y + h), LANDMARK_COLOR, 2)
+        x, y, bw, bh = map(int, d.bbox)
+        cv2.rectangle(img, (x, y), (x + bw, y + bh), LANDMARK_COLOR, 2)
         name = names[d.class_id] if 0 <= d.class_id < len(names) else str(d.class_id)
-        cv2.putText(img, f"{name} {d.confidence:.2f}", (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, LANDMARK_COLOR, 1, cv2.LINE_AA)
+        cv2.putText(
+            img, f"{name} {d.confidence:.2f}", (x, max(12, y - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, LANDMARK_COLOR, 1, cv2.LINE_AA,
+        )
+
     poly = loc.get("polygon")
+    offset = loc.get("offset") or target_center_offset(poly, frame.shape)
     if poly is not None:
         color = TARGET_COLOR if loc["source"].startswith("yolo") else INFERRED_COLOR
         pts = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], color)
+        cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+        cv2.polylines(img, [pts], True, (255, 255, 255), 5, cv2.LINE_AA)
         cv2.polylines(img, [pts], True, color, 3, cv2.LINE_AA)
-        h, w = img.shape[:2]
-        c = poly.mean(axis=0)
-        if not (0 <= c[0] < w and 0 <= c[1] < h):
-            center = np.array([w / 2, h / 2])
-            v = c - center
-            tip = center + v / max(1e-6, np.linalg.norm(v)) * 0.4 * min(w, h)
-            cv2.arrowedLine(img, tuple(map(int, center)), tuple(map(int, tip)), INFERRED_COLOR, 3, tipLength=0.2)
-    label = {"yolo": "TARGET (detected)", "yolo_low": "target? (low conf)", "landmarks": "TARGET (from landmarks)", "none": "searching…"}[loc["source"]]
-    cv2.putText(img, f"{label} {loc['confidence']:.2f}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(img, f"{label} {loc['confidence']:.2f}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        tc = poly.mean(axis=0)
+        tip = (int(round(tc[0])), int(round(tc[1])))
+        # Line / arrow from image center to target (works on- and off-screen).
+        if offset is not None and offset["distance_px"] > 2:
+            if offset["in_frame"]:
+                cv2.arrowedLine(img, center, tip, color, 2, cv2.LINE_AA, tipLength=0.12)
+            else:
+                v = tc.astype(float) - np.array([w / 2.0, h / 2.0])
+                edge = np.array([w / 2.0, h / 2.0]) + v / max(1e-6, np.linalg.norm(v)) * 0.42 * min(w, h)
+                cv2.arrowedLine(img, center, tuple(map(int, edge)), color, 3, cv2.LINE_AA, tipLength=0.18)
+            if offset["in_frame"]:
+                cv2.drawMarker(img, tip, (255, 255, 255), cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA)
+                cv2.drawMarker(img, tip, color, cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
+
+    label = {
+        "yolo": "TARGET (detected)",
+        "yolo_low": "target? (low conf)",
+        "landmarks": "TARGET (from landmarks)",
+        "none": "searching…",
+    }[loc["source"]]
+    _put_outlined(img, f"{label} {loc['confidence']:.2f}", (12, 28), (255, 255, 255), 0.75, 2)
+
+    if offset is not None:
+        dist = offset["distance_px"]
+        dx, dy = offset["dx"], offset["dy"]
+        via = "landmarks" if loc["source"] == "landmarks" else "direct"
+        dist_txt = f"center dist {dist:.0f}px  dx={dx:+.0f} dy={dy:+.0f}  ({via})"
+        _put_outlined(img, dist_txt, (12, 58), CENTER_COLOR if via == "direct" else INFERRED_COLOR, 0.65, 2)
+        if loc.get("landmarks_used"):
+            used = ",".join(str(i) for i in loc["landmarks_used"])
+            _put_outlined(img, f"aux objects: {used}", (12, 84), LANDMARK_COLOR, 0.55, 1)
+    elif loc["source"] == "none":
+        _put_outlined(img, "no target / no landmarks for distance", (12, 58), (180, 180, 180), 0.6, 2)
+
     return img
 
 

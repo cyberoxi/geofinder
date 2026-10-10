@@ -1,0 +1,12 @@
+---
+description: Keep agent prompts small — modular files and narrow context
+alwaysApply: true
+---
+
+# Token efficiency
+
+- Before editing, open only the module listed in `AGENTS.md` for that task.
+- Do not dump whole packages or `README.md` into context unless asked.
+- New/changed Python files should stay under ~400 lines; split by responsibility.
+- Ignore `data/`, `models/*.{pt,onnx,engine}`, videos, and caches (see `.cursorignore`).
+- Prefer patching a small sibling module over growing a god-file.

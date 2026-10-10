@@ -1,0 +1,19 @@
+{
+  "manifest.json": "fc3511867a2ee65f80294e7b8086761007fe1246f26e2ef1928fdcc7f975ca74",
+  "README_DEPLOYMENT.md": "9de24f5fc315e15abfd4ca1fe051acd469cfffc3d6ff4b94f3cbae2a011ac8f2",
+  "config/runtime.yaml": "faa3afcdd14f09c849b89f12bdcd8313efba37028ec2a23a54704ec099e90450",
+  "labels/classes.txt": "94f34584e1de4cfb6ff1f8635ae67b767f8a2b828bcac1ac7722f3f6c39c0505",
+  "model/best.pt": "1b00c84fb7e48e5b994928283cab7e769620241a14ba3014db6b9fd8b8694006",
+  "model/model.onnx": "55bb9ba5b663673a6a9d9d13cebb87ec3c62ddbd45353ae79f2c457d17d8462d",
+  "reference/color_hist.npy": "4321916b89f82848d00382b8da7ba64a4847fa9cf936179910ce6cbeb6da38ef",
+  "reference/descriptors.npz": "b69656d9a1e97bbf9920877a6cba60258022385b7d5112f907295c7bdc9e0357",
+  "reference/reference_image.jpg": "3f9126ab82d6fc8317d4901d5937c04abeeb33049e2ce0577cf844de0be637ae",
+  "reference/roi_mask.png": "49744823ea289966a96d7ba5f0338357650053dfeaee564fe6adbf2961371e40",
+  "reference/scene.json": "88daca8d0423561bf7053ec636d3c5910735253294b944cd4f60a5903bb8c263",
+  "reference/templates/template_0.50.jpg": "81927bdcaa51461796ffd2651cc44be55d4302a2e36e1cf4f9a4f570507d73d8",
+  "reference/templates/template_0.75.jpg": "ec79ce0aac0da5bd3afecc786c490369b15a1ccc45be94ee4eede7e10466765d",
+  "reference/templates/template_1.00.jpg": "3f1ed50de26a87e2d181a6e31a1e6619a4be4c6bb06105611d76965ed17f7e31",
+  "reference/templates/template_1.25.jpg": "a441b0e44fb1aaab4acb76434d77e12aa407f325ae500dae42b155c08a508566",
+  "reference/templates/template_1.50.jpg": "83ccfd7d2788338e2ff2257720ea1fb12df972630e23ccd40a08843b16bad22a",
+  "reference/templates/template_2.00.jpg": "5da88c25648605fc053da293d4fe546e9d60fb3b4d4e947f61517236fec032a6"
+}

@@ -34,6 +34,8 @@ class AutoPipelineConfig:
     export_onnx: bool = True
     build_package: bool = True
     evaluate: bool = True
+    base_model: Optional[str] = None  # existing .pt to fine-tune (region atlas); None → stock yolov8n
+    freeze: int = 0  # layers to freeze when fine-tuning (10 = YOLOv8 backbone)
 
 
 def _parse_fraction(msg: str) -> Optional[float]:
@@ -99,15 +101,29 @@ class AutoPipeline:
         if self.runner is not None:
             self.runner.request_stop()
 
-    def _emit(self, stage: str, msg: str, fraction: Optional[float] = None) -> None:
-        """fraction = progress inside the stage (0..1); mapped to an overall percentage."""
+    def _emit(
+        self,
+        stage: str,
+        msg: str,
+        fraction: Optional[float] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """fraction = progress inside the stage (0..1); mapped to an overall percentage.
+
+        When ``detail`` is set (e.g. live train metrics), the third callback arg is a dict
+        with ``pct`` plus the detail fields so the UI can update charts.
+        """
         logger.info("[%s] %s", stage, msg)
         lo, hi = STAGE_RANGE.get(stage, (0, 100))
         pct = None if fraction is None else lo + (hi - lo) * max(0.0, min(1.0, fraction))
         if pct is None and stage in STAGE_RANGE:
             pct = lo
         if self.progress_cb:
-            self.progress_cb(stage, msg, pct)
+            if detail is not None:
+                payload = {"pct": pct, **detail}
+                self.progress_cb(stage, msg, payload)
+            else:
+                self.progress_cb(stage, msg, pct)
 
     def _check_stop(self) -> None:
         if self._stop:
@@ -139,7 +155,8 @@ class AutoPipeline:
             self._check_stop()
 
             # 2. Train
-            self._emit("train", f"Training {self.cfg.model_type} on {device} for {self.cfg.epochs} epochs…")
+            src = f" (fine-tune from {Path(self.cfg.base_model).name}, freeze={self.cfg.freeze})" if self.cfg.base_model else ""
+            self._emit("train", f"Training {self.cfg.model_type} on {device} for {self.cfg.epochs} epochs{src}…")
             self.runner = TrainingRunner(
                 dataset_dir / "data.yaml",
                 pm.runs_dir,
@@ -148,11 +165,13 @@ class AutoPipeline:
                 batch=self.cfg.batch,
                 imgsz=self.cfg.imgsz,
                 device=device,
+                freeze=self.cfg.freeze,
+                **({"base_model": self.cfg.base_model} if self.cfg.base_model else {}),
             )
 
             def _train_cb(d: Dict[str, Any]) -> None:
                 if "status" in d:
-                    self._emit("train", d["status"], 0.0)
+                    self._emit("train", d["status"], 0.0, detail={"status": d["status"]})
                     return
                 if d.get("type") == "batch":
                     eta = d.get("eta_sec")
@@ -161,6 +180,15 @@ class AutoPipeline:
                         "train",
                         f"Epoch {d['epoch']}/{d['epochs']} batch {d['batch']}/{d['nb']}{eta_s}",
                         d.get("fraction"),
+                        detail={
+                            "type": "batch",
+                            "epoch": d.get("epoch"),
+                            "epochs": d.get("epochs"),
+                            "batch": d.get("batch"),
+                            "nb": d.get("nb"),
+                            "fraction": d.get("fraction"),
+                            "eta_sec": eta,
+                        },
                     )
                     return
                 m = d.get("metrics", {})
@@ -170,7 +198,16 @@ class AutoPipeline:
                 extra = f" {key}={m[key]:.3f}" if key else ""
                 ep = d.get("epoch", 0)
                 label = f"Epoch {ep}/{self.cfg.epochs}" if ep <= self.cfg.epochs else "Final validation"
-                self._emit("train", f"{label}{extra}", min(1.0, ep / max(1, self.cfg.epochs)))
+                self._emit(
+                    "train",
+                    f"{label}{extra}",
+                    min(1.0, ep / max(1, self.cfg.epochs)),
+                    detail={
+                        "epoch": ep,
+                        "epochs": self.cfg.epochs,
+                        "metrics": m,
+                    },
+                )
 
             train = self.runner.run(progress_cb=_train_cb)
             summary["train"] = train

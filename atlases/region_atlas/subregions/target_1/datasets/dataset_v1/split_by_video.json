@@ -1,0 +1,30 @@
+{
+  "split_map": {
+    "9438ca20455a": "train",
+    "4c6b673b4751": "val",
+    "c38ba47910be": "test"
+  },
+  "counts": {
+    "train": 148,
+    "val": 28,
+    "test": 1
+  },
+  "negatives": {
+    "train": 0,
+    "val": 0,
+    "test": 0
+  },
+  "classes": [
+    "target_region",
+    "landmark_1_water",
+    "landmark_2_building",
+    "landmark_3_sports_field",
+    "landmark_4_building",
+    "landmark_5_water",
+    "landmark_6_water",
+    "landmark_7_building",
+    "landmark_8_water",
+    "landmark_9_building",
+    "landmark_10_building"
+  ]
+}

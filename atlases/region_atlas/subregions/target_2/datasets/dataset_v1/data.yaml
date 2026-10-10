@@ -1,0 +1,17 @@
+path: E:\Projects\geofinder\atlases\region_atlas\subregions\target_2\datasets\dataset_v1
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: target_region
+  1: landmark_1_water
+  2: landmark_2_building
+  3: landmark_3_sports_field
+  4: landmark_4_building
+  5: landmark_5_water
+  6: landmark_6_water
+  7: landmark_7_building
+  8: landmark_8_water
+  9: landmark_9_building
+  10: landmark_10_building
+nc: 11

@@ -1,0 +1,39 @@
+﻿# Keep agent context small — exclude bulky / generated artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Data & media (read via tools only when needed)
+data/output/
+data/projects/
+data/packages/
+data/satellite_cache/
+data/failed_frames/
+**/*.mp4
+**/*.avi
+**/*.mkv
+**/*.jpg
+**/*.jpeg
+**/*.png
+**/*.tif
+**/*.tiff
+!**/.gitkeep
+
+# Model weights & engines
+models/*.pt
+models/*.onnx
+models/*.engine
+**/*.pt
+**/*.onnx
+**/*.engine
+
+# Logs & caches
+logs/
+*.log
+.cache/
+
+# One-shot / temp scripts
+tools/_split_*.py

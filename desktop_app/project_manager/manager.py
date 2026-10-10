@@ -144,17 +144,25 @@ class ProjectManager:
     ) -> Path:
         """Install the scene layout (target + landmarks) used for multi-class training."""
         self.scene_dir.mkdir(parents=True, exist_ok=True)
+        src_dir = Path(scene_json).parent
         shutil.copy2(scene_json, self.scene_path)
         if candidates and Path(candidates).exists():
             shutil.copy2(candidates, self.scene_dir / "candidates.json")
         for old_extra in self.scene_dir.glob("mosaic_extra_*"):
             old_extra.unlink()
-        for extra in Path(scene_json).parent.glob("mosaic_extra_*"):
+        for extra in src_dir.glob("mosaic_extra_*"):
             shutil.copy2(extra, self.scene_dir / extra.name)
         if preview and Path(preview).exists():
             shutil.copy2(preview, self.scene_dir / "scene_preview.jpg")
-        if mosaic and Path(mosaic).exists():
-            shutil.copy2(mosaic, self.scene_dir / "mosaic.jpg")
+        mos = Path(mosaic) if mosaic else None
+        if mos is None or not mos.exists():
+            for name in ("satellite_mosaic.jpg", "mosaic.jpg"):
+                cand = src_dir / name
+                if cand.exists():
+                    mos = cand
+                    break
+        if mos is not None and mos.exists():
+            shutil.copy2(mos, self.scene_dir / "mosaic.jpg")
         return self.scene_path
 
     def scene_layout(self):
