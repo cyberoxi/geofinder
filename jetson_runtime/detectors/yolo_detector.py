@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from shared.logging import get_logger
@@ -120,7 +119,11 @@ class YOLODetector:
 
         t0 = time.perf_counter()
         try:
-            self.model = YOLO(str(path))
+            # Exported files are named model.onnx / model.engine: older Ultralytics (JetPack) and
+            # trtexec engines carry no task metadata, so it would guess "detect" and decode a
+            # segmentation head as junk classes. .pt checkpoints know their own task.
+            task = None if path.suffix.lower() == ".pt" else ("segment" if self.mode == "segmentation" else "detect")
+            self.model = YOLO(str(path), task=task)
             self.device = self._pick_device(path)
             suffix = path.suffix.lower()
             if suffix == ".engine":
@@ -211,9 +214,12 @@ class YOLODetector:
         confs = boxes.conf.cpu().numpy()
         clss = boxes.cls.cpu().numpy().astype(int)
 
-        mask_data = None
-        if self.mode == "segmentation" and masks is not None and masks.data is not None:
-            mask_data = masks.data.cpu().numpy()
+        # Mask polygons in frame pixels — same source as the desktop Live Test. ``masks.data`` is in
+        # the letterboxed model-input space (640×640 for ONNX / TensorRT); stretching it to the frame
+        # shifted every polygon, so the aux-geometry checks rejected the real target.
+        polys = None
+        if masks is not None and getattr(masks, "xy", None) is not None:
+            polys = masks.xy
 
         all_dets: List[Detection] = []
         for i, (box, conf, cls_id) in enumerate(zip(xyxy, confs, clss)):
@@ -223,16 +229,8 @@ class YOLODetector:
                 confidence=float(conf),
                 class_id=int(cls_id),
             )
-            if mask_data is not None and i < len(mask_data):
-                m = mask_data[i]
-                # Resize mask to frame size
-                mh, mw = frame.shape[:2]
-                m_resized = cv2.resize(m.astype(np.float32), (mw, mh), interpolation=cv2.INTER_LINEAR)
-                binary = (m_resized > 0.5).astype(np.uint8) * 255
-                det.mask = binary
-                roi = ROI.from_mask(binary)
-                if roi is not None:
-                    det.polygon = roi.points
+            if polys is not None and i < len(polys) and len(polys[i]) >= 3:
+                det.polygon = np.asarray(polys[i], np.float32)
             all_dets.append(det)
         return self._finalize(all_dets, frame.shape)
 

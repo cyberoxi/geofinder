@@ -26,6 +26,14 @@ else:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
+# PySide6/shiboken replaces builtins.__import__. Importing torch *after* that
+# makes torch.cuda init crawl through inspect/getsource (Windows + Py 3.13+)
+# and looks hung until Ctrl+C. Load torch first; later CUDA probes are cheap.
+try:
+    import torch  # noqa: F401
+except Exception:
+    pass
+
 from desktop_app.gui.main_window import main
 
 if __name__ == "__main__":
