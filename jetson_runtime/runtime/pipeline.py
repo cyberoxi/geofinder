@@ -12,6 +12,7 @@ import numpy as np
 from jetson_runtime.detectors.yolo_detector import YOLODetector
 from jetson_runtime.exporters.result_exporter import ResultExporter, draw_overlay
 from jetson_runtime.package_loader.loader import PackageLoader
+from jetson_runtime.runtime.detect_tracker import DetectionTracker
 from jetson_runtime.runtime.hybrid_tracker import MultiScaleHybridTracker
 from jetson_runtime.serial_out import (
     SerialOffsetSender,
@@ -143,12 +144,18 @@ def run_runtime(
     loader = PackageLoader(package_path)
     root = loader.load()
     yolo = build_detector_from_package(loader)
-    tracker = MultiScaleHybridTracker(
-        loader.runtime_config,
-        yolo=yolo,
-        reference_descriptors=loader.descriptors_path(),
-        feature_method=loader.manifest.feature_method if loader.manifest else "AKAZE",
-    )
+    if yolo is not None:
+        if not yolo.available:
+            logger.error("YOLO model could not be loaded — nothing will be detected (see log above)")
+        # Same per-frame detect + stabilizer logic as the desktop Live Test
+        tracker = DetectionTracker(loader.runtime_config, yolo)
+    else:
+        tracker = MultiScaleHybridTracker(
+            loader.runtime_config,
+            yolo=None,
+            reference_descriptors=loader.descriptors_path(),
+            feature_method=loader.manifest.feature_method if loader.manifest else "AKAZE",
+        )
 
     spec = _resolve_source_spec(video_path, prefer_gstreamer, source)
     frame_source: FrameSource = open_input_source(spec)
@@ -175,9 +182,14 @@ def run_runtime(
         frame_source.release()
         raise RuntimeError(f"Cannot read frames from {source_label}")
 
-    if initial_roi is not None:
+    if isinstance(tracker, DetectionTracker):
+        # No guessed start ROI: the detector + stabilizer decide from frame 0
+        if initial_roi is not None:
+            tracker.initialize(frame, initial_roi)
+    elif initial_roi is not None:
         tracker.initialize(frame, initial_roi)
     else:
+        # Feature-only mode (no model): may start from the package reference polygon
         ok_init = tracker.initialize_from_search(frame)
         # While the temporal filter is confirming a candidate, keep searching instead of guessing a ROI
         if tracker.awaiting_confirmation:
@@ -231,7 +243,12 @@ def run_runtime(
 
             fh, fw = frame.shape[:2]
             info = result.to_dict()
-            if state.roi is not None:
+            is_tracking = (
+                tracker.is_tracking
+                if isinstance(tracker, DetectionTracker)
+                else state.status in tracking_ok and state.roi is not None
+            )
+            if is_tracking:
                 dx, dy, dist = image_to_target_offset(fw, fh, result.center_x, result.center_y)
             else:
                 dx, dy, dist = 0.0, 0.0, 0.0
@@ -239,7 +256,6 @@ def run_runtime(
             info["offset_dy"] = dy
             info["offset_dist"] = dist
             info["source"] = source_label
-            is_tracking = state.status in tracking_ok and state.roi is not None
             serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
 
             annotated = draw_overlay(frame, result, trail=state.trail)

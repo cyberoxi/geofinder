@@ -33,6 +33,7 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Atlas sub-region fine-tune | `desktop_app/atlas/finetune.py` |
 | Atlas UI actions / dialogs | `desktop_app/gui/atlas_actions.py`, `atlas_build_dialog.py`, `atlas_finetune_dialog.py` |
 | Jetson runtime | `jetson_runtime/runtime/pipeline.py` |
+| Jetson per-frame detect + stabilizer (same logic as desktop Live Test) | `jetson_runtime/runtime/detect_tracker.py` (legacy feature-only: `hybrid_tracker.py`) |
 | Jetson video / CSI / USB input | `jetson_runtime/runtime/sources.py`, `shared/video_reader.py`; UI `jetson_runtime/gui/source_dialog.py` |
 | Jetson camera live preview / test | `jetson_runtime/gui/camera_test_dialog.py` |
 | Jetson serial dx/dy | `shared/serial_out.py`, `jetson_runtime/gui/serial_dialog.py` (re-export: `jetson_runtime/serial_out.py`) |
