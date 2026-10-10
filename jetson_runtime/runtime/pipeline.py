@@ -36,14 +36,35 @@ class RTSPVideoSource:
         raise NotImplementedError("RTSP source is reserved for a future release. Use file video for now.")
 
 
+def _pick_model_path(engine, onnx, pt) -> tuple[str, list[str]]:
+    """Prefer TensorRT, then GPU ONNX, else PyTorch (CUDA) over CPU-only ONNX."""
+    if engine is not None:
+        primary = engine
+    elif onnx is not None and pt is not None:
+        try:
+            import onnxruntime as ort
+
+            providers = ort.get_available_providers()
+            gpu_ort = any(p in providers for p in ("CUDAExecutionProvider", "TensorrtExecutionProvider"))
+        except Exception:  # noqa: BLE001
+            gpu_ort = False
+        # CPU ORT is much slower than .pt on Orin CUDA; Live Test on desktop uses .pt.
+        primary = onnx if gpu_ort else pt
+    else:
+        primary = onnx or pt
+    if primary is None:
+        return "", []
+    fallbacks = [str(p) for p in (engine, onnx, pt) if p is not None and p != primary]
+    return str(primary), fallbacks
+
+
 def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]:
     engine, onnx, pt = loader.model_candidates()
     ycfg = loader.runtime_config.get("yolo", {})
-    model_path = str(engine or onnx or pt or "")
+    model_path, fallbacks = _pick_model_path(engine, onnx, pt)
     if not model_path:
         logger.warning("No model in package — feature/homography-only mode")
         return None
-    fallbacks = [str(p) for p in (onnx, pt) if p and str(p) != model_path]
     localizer = None
     scene_rel = getattr(loader.manifest, "scene_layout", "") if loader.manifest else ""
     if scene_rel and loader.root is not None and (loader.root / scene_rel).exists():
@@ -121,7 +142,17 @@ def run_runtime(
     if yolo is not None:
         logger.info("Min confidence %.0f%%", yolo.confidence_threshold * 100)
         if not yolo.available:
-            logger.error("YOLO model could not be loaded — nothing will be detected (see log above)")
+            # Package has a model but the runtime stack failed (missing ultralytics/torch,
+            # bad ONNX/engine, …). Do not silently search forever with empty detections.
+            raise RuntimeError(
+                "YOLO model could not be loaded — nothing will be detected.\n"
+                "مدل YOLO بارگذاری نشد؛ هیچ هدفی شناسایی نمی‌شود.\n\n"
+                "On Jetson (venv):\n"
+                "  pip install --pre torch torchvision "
+                "--extra-index-url https://download.pytorch.org/whl/cu132\n"
+                "  pip install ultralytics onnx\n\n"
+                "Then restart the app with: source .venv/bin/activate"
+            )
         # Same per-frame detect + stabilizer logic as the desktop Live Test
         tracker = DetectionTracker(loader.runtime_config, yolo)
     else:

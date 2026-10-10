@@ -144,8 +144,9 @@ class VideoReader:
         )
         if not obj._try_open(pipe, cv2.CAP_GSTREAMER, rewind=False):
             raise RuntimeError(
-                f"Cannot open IMX477 CSI (sensor-id={sensor_id}). "
-                "Check cable, Jetson CSI connection, and Argus / nvargus-daemon."
+                f"Cannot open CSI (sensor-id={sensor_id}, {width}x{height}@{fps}). "
+                "Argus reported no usable camera. Enable the matching IMX overlay "
+                "in Jetson-IO and reboot; also try sensor-id 1 if the ribbon is on CAM1."
             )
         obj.backend = "imx477-argus"
         obj._finish_live_info(width=width, height=height, fps=float(fps))

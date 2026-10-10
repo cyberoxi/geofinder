@@ -7,6 +7,7 @@ psutil>=5.9
 pyserial>=3.5
 # GUI (pick one):
 PySide6>=6.5
-# Optional inference stack (after JetPack-matched torch if needed):
-# ultralytics
-# onnx
+# YOLO inference (JetPack 7.2 / CUDA 13.2). Keep system OpenCV — do NOT pip install opencv-python.
+#   pip install --pre torch torchvision --extra-index-url https://download.pytorch.org/whl/cu132
+#   pip install ultralytics onnx onnxruntime
+#   pip install 'numpy>=1.26,<2'   # ultralytics may pull numpy 2; pin back for Jetson OpenCV
