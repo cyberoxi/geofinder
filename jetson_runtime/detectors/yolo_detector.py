@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,11 @@ from shared.target_filter import filter_frame
 from shared.target_stabilizer import detector_conf, merge_stabilizer_config
 
 logger = get_logger("grt.yolo")
+
+# The Jetson is offline: never let Ultralytics pip-install packages at load time. Its AutoUpdate
+# can replace onnxruntime with onnxruntime-gpu built for another CUDA, after which every
+# inference fails and nothing is detected. Missing packages must be installed by setup instead.
+os.environ.setdefault("YOLO_AUTOINSTALL", "False")
 
 
 class YOLODetector:
@@ -73,6 +79,13 @@ class YOLODetector:
         self.last_rejected: List[Any] = []
         self.predict_count = 0
         self._load_model()
+
+    def set_confidence(self, conf: float) -> None:
+        """Change the min confidence live (Jetson GUI slider), like the desktop Live Test."""
+        self.confidence_threshold = max(0.01, min(0.99, float(conf)))
+        self.predict_conf = detector_conf(self.confidence_threshold, self.stabilizer_cfg)
+        if self.localizer is not None:
+            self.localizer.min_confidence = self.confidence_threshold
 
     def _resolve_path(self) -> Optional[Path]:
         candidates = [self._model_path, *self._fallback_paths]
@@ -149,22 +162,21 @@ class YOLODetector:
             logger.error("Failed to load YOLO model %s: %s", path, exc)
             self.model = None
             self.available = False
-            # TensorRT engine may be incompatible with this device
-            if path.suffix.lower() == ".engine":
-                for fb in self._fallback_paths:
-                    fb_path = Path(fb) if fb else None
-                    if fb_path and fb_path.exists() and fb_path.suffix.lower() != ".engine":
-                        logger.info("Trying fallback model: %s", fb_path)
-                        self._model_path = str(fb_path)
-                        self._fallback_paths = [p for p in self._fallback_paths if p != fb]
-                        self._load_model()
-                        return
+            # Engine built for another device / ONNX without a working runtime → next model in the package
+            for fb in self._fallback_paths:
+                fb_path = Path(fb) if fb else None
+                if fb_path and fb_path.exists() and fb_path != path:
+                    logger.info("Trying fallback model: %s", fb_path)
+                    self._model_path = str(fb_path)
+                    self._fallback_paths = [p for p in self._fallback_paths if p != fb]
+                    self._load_model()
+                    return
 
     def warmup(self) -> None:
         if not self.available or self.model is None:
             return
         dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
-        for _ in range(max(1, self.warmup_iterations)):
+        for i in range(max(1, self.warmup_iterations)):
             try:
                 self.model.predict(
                     dummy,
@@ -176,6 +188,9 @@ class YOLODetector:
                     verbose=False,
                 )
             except Exception as exc:  # noqa: BLE001
+                if i == 0:
+                    # Not one inference works: treat as a load failure so a fallback model is tried
+                    raise RuntimeError(f"test inference failed: {exc}") from exc
                 logger.warning("Warmup issue: %s", exc)
                 break
         logger.info("YOLO warmup complete (%d iters)", self.warmup_iterations)

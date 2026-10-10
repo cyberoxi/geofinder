@@ -31,6 +31,8 @@ def parse_args():
     p.add_argument("--headless", action="store_true")
     p.add_argument("--output", default=None)
     p.add_argument("--end-frame", type=int, default=-1)
+    p.add_argument("--min-conf", type=float, default=None,
+                   help="Min detection confidence in %% (1-99); default = package value (Live Test)")
     p.add_argument("--serial", action="store_true", help="Enable UART offset send (dx,dy)")
     p.add_argument("--serial-port", default=None, help="Serial device, e.g. /dev/ttyTHS1 or /dev/ttyUSB0")
     p.add_argument("--serial-baud", type=int, default=None, help="Baud rate (default 115200)")
@@ -88,6 +90,7 @@ def main() -> int:
             output_dir=args.output,
             end_frame=args.end_frame,
             serial_override=serial_override,
+            min_conf=args.min_conf / 100.0 if args.min_conf is not None else None,
         )
         print("Done.")
         for k, v in result.get("paths", {}).items():

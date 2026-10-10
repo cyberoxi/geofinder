@@ -49,6 +49,7 @@ from shared.qt_compat import (
 )
 from shared.video_reader import VideoReader
 from jetson_runtime.gui.camera_test_dialog import open_camera_test
+from jetson_runtime.gui.confidence_control import ConfidenceControl
 from jetson_runtime.gui.serial_dialog import edit_serial_settings, load_serial_settings
 from jetson_runtime.gui.source_dialog import choose_input_source
 from jetson_runtime.runtime.pipeline import run_runtime
@@ -66,11 +67,13 @@ class ProcessWorker(QThread):
         package: str,
         source_spec: InputSourceSpec,
         serial_cfg: Optional[dict] = None,
+        min_conf_cb=None,
     ):
         super().__init__()
         self.package = package
         self.source_spec = source_spec
         self.serial_cfg = serial_cfg
+        self.min_conf_cb = min_conf_cb
         self._stop = False
 
     def request_stop(self):
@@ -86,6 +89,8 @@ class ProcessWorker(QThread):
                 frame_cb=lambda fr, info: self.frame_updated.emit(fr, info),
                 stop_flag=lambda: self._stop,
                 serial_override=self.serial_cfg,
+                min_conf=self.min_conf_cb() if self.min_conf_cb else None,
+                min_conf_cb=self.min_conf_cb,
             )
             self.finished_ok.emit(result)
         except Exception as exc:  # noqa: BLE001
@@ -227,6 +232,10 @@ class JetsonMainWindow(QMainWindow):
         sv.addStretch(1)
         split.addWidget(side)
 
+        # Same live threshold as the desktop Live Test (drag while processing)
+        self.conf = ConfidenceControl()
+        layout.addWidget(self.conf)
+
         tl = QHBoxLayout()
         self.slider = QSlider(Qt.Horizontal)
         self.slider.valueChanged.connect(self._seek)
@@ -341,6 +350,7 @@ class JetsonMainWindow(QMainWindow):
 
     def _set_package(self, path: str, *, from_usb: bool = False, source: Optional[Path] = None) -> None:
         self.package_path = path
+        self.conf.set_package(path)
         note = ""
         if from_usb and source is not None:
             note = f"\nImported from USB:\n{source}\nStatus: transferred"
@@ -464,7 +474,9 @@ class JetsonMainWindow(QMainWindow):
             self.reader.release()
             self.reader = None
         serial_cfg = load_serial_settings()
-        self.worker = ProcessWorker(self.package_path, self.input_spec, serial_cfg=serial_cfg)
+        self.worker = ProcessWorker(
+            self.package_path, self.input_spec, serial_cfg=serial_cfg, min_conf_cb=self.conf.fraction
+        )
         self.worker.frame_updated.connect(lambda fr, info: self._show(fr, info))
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_ok.connect(self._on_finished)
@@ -487,6 +499,8 @@ class JetsonMainWindow(QMainWindow):
         dy = info.get("offset_dy")
         live = self.input_spec is not None and self.input_spec.kind != KIND_FILE
         prog = f"{c}" if live or t <= 0 else f"{c}/{t}"
+        if info.get("min_conf") is not None:
+            prog += f"  conf≥{info['min_conf'] * 100:.0f}%"
         if dx is not None and dy is not None:
             self.statusBar().showMessage(
                 f"{prog} {info.get('status')}  offset dx={dx:.0f} dy={dy:.0f}"

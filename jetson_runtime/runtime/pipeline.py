@@ -107,12 +107,19 @@ def run_runtime(
     end_frame: int = -1,
     serial_override: Optional[Dict[str, Any]] = None,
     source: Optional[Any] = None,
+    min_conf: Optional[float] = None,
+    min_conf_cb: Optional[Callable[[], Optional[float]]] = None,
 ) -> Dict[str, Any]:
+    """``min_conf`` overrides the package's min confidence; ``min_conf_cb`` is polled every frame
+    so a GUI slider can change it while running (both 0–1)."""
     setup_logging()
     loader = PackageLoader(package_path)
     root = loader.load()
     yolo = build_detector_from_package(loader)
+    if yolo is not None and min_conf is not None:
+        yolo.set_confidence(min_conf)
     if yolo is not None:
+        logger.info("Min confidence %.0f%%", yolo.confidence_threshold * 100)
         if not yolo.available:
             logger.error("YOLO model could not be loaded — nothing will be detected (see log above)")
         # Same per-frame detect + stabilizer logic as the desktop Live Test
@@ -198,6 +205,11 @@ def run_runtime(
                 break
             if idx > last:
                 break
+            if yolo is not None and min_conf_cb is not None:
+                want = min_conf_cb()
+                if want is not None and abs(want - yolo.confidence_threshold) > 1e-6:
+                    yolo.set_confidence(want)
+                    logger.info("Min confidence → %.0f%%", yolo.confidence_threshold * 100)
             t_frame = time.perf_counter()
             state = tracker.update(frame, frame_idx=idx)
             dt = time.perf_counter() - t_frame
@@ -227,6 +239,8 @@ def run_runtime(
             info["offset_dy"] = dy
             info["offset_dist"] = dist
             info["source"] = source_label
+            if yolo is not None:
+                info["min_conf"] = yolo.confidence_threshold
             serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
 
             if isinstance(tracker, DetectionTracker):
