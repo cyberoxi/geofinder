@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-import cv2
 import numpy as np
 
 from jetson_runtime.detectors.yolo_detector import YOLODetector
@@ -20,6 +19,7 @@ from jetson_runtime.serial_out import (
     merge_serial_config,
 )
 from jetson_runtime.runtime.sources import FrameSource, InputSourceSpec, open_input_source
+from shared.localization import draw_localization, put_outlined
 from shared.logging import get_logger, setup_logging
 from shared.schemas import ROI, RuntimeState
 
@@ -75,42 +75,10 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
     )
 
 
-def draw_landmarks(frame, yolo: Optional[YOLODetector]) -> None:
-    """Overlay landmark detections and the landmark-inferred target (in place)."""
-    import cv2
-    import numpy as np
-
-    if yolo is None:
-        return
-    names = yolo.class_names
-    rejected = {id(d): why for d, why in yolo.last_rejected}
-    for d in yolo.last_all_detections:
-        if id(d) in rejected:
-            x, y, w, h = map(int, d.bbox)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (60, 60, 255), 2)
-            cv2.putText(frame, f"X {rejected[id(d)]}", (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 255), 1, cv2.LINE_AA)
-            continue
-        if d.class_id == yolo.target_class or d.confidence < yolo.confidence_threshold:
-            continue
-        x, y, w, h = map(int, d.bbox)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 160, 255), 2)
-        label = names[d.class_id] if 0 <= d.class_id < len(names) else str(d.class_id)
-        cv2.putText(frame, f"{label} {d.confidence:.2f}", (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 160, 255), 1, cv2.LINE_AA)
-    est = yolo.last_localization
-    if est is not None:
-        pts = np.round(est.polygon).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(frame, [pts], True, (255, 0, 255), 2, cv2.LINE_AA)
-        if not est.in_view:
-            # Arrow from frame centre toward the off-screen target
-            h, w = frame.shape[:2]
-            c = np.array([w / 2, h / 2])
-            t = est.polygon.mean(axis=0)
-            v = t - c
-            n = np.linalg.norm(v)
-            if n > 1:
-                tip = c + v / n * min(n, 0.4 * min(w, h))
-                cv2.arrowedLine(frame, tuple(map(int, c)), tuple(map(int, tip)), (255, 0, 255), 3, tipLength=0.2)
-                cv2.putText(frame, "target", tuple(map(int, tip)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+def _draw_footer(img: np.ndarray, result) -> None:
+    """Runtime stats under the desktop-style overlay (bottom-left)."""
+    text = f"frame {result.frame_id}  {result.process_fps:.1f} fps  infer {result.inference_ms:.0f} ms"
+    put_outlined(img, text, (12, img.shape[0] - 14), (230, 230, 230), 0.6, 2)
 
 
 def _resolve_source_spec(
@@ -212,7 +180,6 @@ def run_runtime(
             logger.warning("Initial search failed; continuing with SEARCHING state")
 
     processed = 0
-    last_predict = -1
     fps_list = []
     t0 = time.perf_counter()
     idx = 0
@@ -248,7 +215,11 @@ def run_runtime(
                 if isinstance(tracker, DetectionTracker)
                 else state.status in tracking_ok and state.roi is not None
             )
-            if is_tracking:
+            off = tracker.loc.get("offset") if isinstance(tracker, DetectionTracker) else None
+            if is_tracking and off is not None:
+                # Target centroid − image centre: the same numbers the overlay shows (desktop parity)
+                dx, dy, dist = off["dx"], off["dy"], off["distance_px"]
+            elif is_tracking:
                 dx, dy, dist = image_to_target_offset(fw, fh, result.center_x, result.center_y)
             else:
                 dx, dy, dist = 0.0, 0.0, 0.0
@@ -258,10 +229,13 @@ def run_runtime(
             info["source"] = source_label
             serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
 
-            annotated = draw_overlay(frame, result, trail=state.trail)
-            if yolo is not None and yolo.predict_count != last_predict:
-                draw_landmarks(annotated, yolo)
-                last_predict = yolo.predict_count
+            if isinstance(tracker, DetectionTracker):
+                # Same overlay as the desktop Live Test: target / aux objects / rejected / confirming,
+                # centre cross, arrow to the target (frame edge when off-screen), centre distance
+                annotated = draw_localization(frame, tracker.dets, tracker.loc, yolo.class_names)
+                _draw_footer(annotated, result)
+            else:
+                annotated = draw_overlay(frame, result, trail=state.trail)
             exporter.write_frame(annotated)
             if state.status == RuntimeState.LOST and loader.runtime_config.get("export", {}).get("save_failed_frames", True):
                 exporter.save_failed_frame(frame, idx)

@@ -1,9 +1,9 @@
 """Detection-first tracker for Jetson: the same logic as the desktop Live Test.
 
-Every processed frame runs YOLO (geometry / aux filters live in ``YOLODetector``), then the
-shared :class:`TargetStabilizer` decides: confirm → lock → coast → search. A target is only
-reported while the stabilizer is locked or coasting, so nothing is drawn or sent over serial
-for a frame the model did not actually confirm.
+Every processed frame runs YOLO, then :func:`shared.localization.stabilize_frame` (geometry / aux
+filters + the shared :class:`TargetStabilizer`) decides: confirm → lock → coast → search. A target is
+only reported while the stabilizer is locked or coasting. ``self.loc`` / ``self.dets`` hold the last
+decision for :func:`shared.localization.draw_localization` (the same overlay as the desktop).
 
 Optional: with ``tracking.detect_every_n`` > 1, optical flow bridges the frames between
 detector runs while locked (faster on slow boards, less exact).
@@ -11,15 +11,16 @@ detector runs while locked (faster on slow boards, less exact).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from jetson_runtime.detectors.yolo_detector import YOLODetector
 from jetson_runtime.trackers.optical_flow_tracker import OpticalFlowTracker
 from shared.logging import get_logger
-from shared.schemas import FrameResult, ROI, RuntimeState, TrackerState, TrackingMethod
-from shared.target_stabilizer import CONFIRMING, COASTING, LOCKED, Candidate, TargetStabilizer
+from shared.localization import stabilize_frame, target_center_offset
+from shared.schemas import Detection, FrameResult, ROI, RuntimeState, TrackerState, TrackingMethod
+from shared.target_stabilizer import CONFIRMING, COASTING, LOCKED, TargetStabilizer
 
 logger = get_logger("jetson.detect")
 
@@ -40,6 +41,10 @@ class DetectionTracker:
         self.state = TrackerState(status=RuntimeState.SEARCHING)
         self._last_detect = -(10**9)
         self._flow_ok = False
+        # Last per-frame decision, drawn by shared.localization.draw_localization
+        self.dets: List[Detection] = []
+        self.loc: Dict[str, Any] = {"polygon": None, "source": "none", "confidence": 0.0,
+                                    "state": "searching", "tracking": False, "offset": None}
         self.stats = {"tracked": 0, "lost": 0, "yolo": 0, "landmarks": 0, "predicted": 0,
                       "optical_flow": 0, "searching": 0, "redetect": 0}
 
@@ -63,26 +68,22 @@ class DetectionTracker:
         return TrackingMethod.YOLO_SEG if self.yolo.mode == "segmentation" else TrackingMethod.YOLO
 
     def _detect(self, frame: np.ndarray, idx: int) -> None:
-        dets = self.yolo.predict(frame)
+        dets = self.yolo.predict_raw(frame)
         self.state.inference_ms = self.yolo.last_inference_ms
-        min_conf = self.yolo.confidence_threshold
-        cands = [
-            Candidate(self.yolo.detection_to_roi(d, idx).points, float(d.confidence),
-                      getattr(d, "source", "yolo"), int(getattr(d, "n_landmarks", 0)))
-            for d in dets
-        ]
-        st = self.stabilizer.update(cands, min_conf, idx)
-        self.filter_state = st.state
+        loc = stabilize_frame(dets, self.yolo.localizer, frame.shape, self.yolo.confidence_threshold,
+                              self.stabilizer, idx)
+        self.dets, self.loc = dets, loc
+        self.filter_state = loc["state"]
         self._last_detect = idx
-        if st.state in (LOCKED, COASTING) and st.polygon is not None:
-            roi = ROI(st.polygon, frame_index=idx)
+        if loc["tracking"]:
+            roi = ROI(loc["polygon"], frame_index=idx)
             self.state.roi = roi
-            self.state.confidence = float(st.confidence)
-            self.state.method = self._method() if st.source != "predicted" else TrackingMethod.NONE
-            self.state.status = RuntimeState.TRACKING if st.state == LOCKED else RuntimeState.RE_DETECTING
-            self.state.message = st.source
-            self.stats[st.source if st.source in self.stats else "yolo"] += 1
-            if self.detect_every_n > 1 and st.source != "predicted":
+            self.state.confidence = float(loc["confidence"])
+            self.state.method = self._method() if loc["source"] != "predicted" else TrackingMethod.NONE
+            self.state.status = RuntimeState.TRACKING if loc["state"] == LOCKED else RuntimeState.RE_DETECTING
+            self.state.message = loc["source"]
+            self.stats[loc["source"] if loc["source"] in self.stats else "yolo"] += 1
+            if self.detect_every_n > 1 and loc["source"] != "predicted":
                 self._flow_ok = self.optical_flow.initialize(frame, roi)
             return
         # searching / confirming: no target is reported
@@ -90,7 +91,7 @@ class DetectionTracker:
         self.state.confidence = 0.0
         self.state.method = TrackingMethod.NONE
         self.state.status = RuntimeState.SEARCHING
-        self.state.message = f"confirming {st.progress}" if st.state == CONFIRMING else "searching"
+        self.state.message = f"confirming {loc['progress']}" if loc["state"] == CONFIRMING else "searching"
         self._flow_ok = False
         self.stats["searching"] += 1
 
@@ -104,6 +105,10 @@ class DetectionTracker:
         self.state.roi = roi
         self.state.method = TrackingMethod.OPTICAL_FLOW
         self.stabilizer.follow(roi.points, idx)
+        # No detector run this frame: move the drawn target, keep no stale detections
+        self.dets = []
+        self.loc = {**self.loc, "polygon": roi.points, "pending_polygon": None, "rejected": [],
+                    "offset": target_center_offset(roi.points, frame.shape)}
         self.stats["optical_flow"] += 1
         return True
 

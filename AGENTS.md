@@ -23,6 +23,7 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Tiles / Wayback | `desktop_app/satellite/tiles.py` |
 | Offline maps (MBTiles packages, offline mode flag, region download) | `desktop_app/satellite/offline.py` |
 | Offline Mode menu / dialog | `desktop_app/gui/offline_actions.py`, `desktop_app/gui/offline_dialog.py` |
+| Target decision + overlay (desktop Live Test = Jetson display) | `shared/localization.py` (`stabilize_frame`, `draw_localization`) |
 | False-target filters (geometry / aux consistency) | `shared/target_filter.py` |
 | Temporal confirm + gate + coast (desktop + Jetson) | `shared/target_stabilizer.py`; config `stabilizer` in `shared/config/__init__.py` |
 | Detection Filters dialog (QSettings → package) | `desktop_app/gui/stabilizer_dialog.py` |

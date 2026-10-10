@@ -13,12 +13,13 @@ class FakeYolo:
     mode = "detection"
     confidence_threshold = 0.35
     last_inference_ms = 5.0
+    localizer = None
 
     def __init__(self, boxes):
         self.boxes = boxes  # frame index -> (x, y, w, h) or None
         self.i = -1
 
-    def predict(self, frame):
+    def predict_raw(self, frame):
         self.i += 1
         b = self.boxes(self.i)
         return [] if b is None else [Detection(bbox=b, confidence=0.9, class_id=0)]

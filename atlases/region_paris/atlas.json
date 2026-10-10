@@ -400,8 +400,11 @@
       "landmarks_added": 9
     }
   ],
-  "base_weights": "",
-  "metrics": {},
+  "base_weights": "base_model\\best.pt",
+  "metrics": {
+    "device": "0",
+    "results_dir": "E:\\Projects\\geofinder\\atlases\\region_paris\\base_project\\runs\\train"
+  },
   "settings": {
     "build": {
       "landmarks_per_chunk": 10,
@@ -419,7 +422,7 @@
     "landmarks_frozen": true
   },
   "created_at": "2026-10-10T17:50:58.582038+00:00",
-  "updated_at": "2026-10-10T17:52:15.913795+00:00",
+  "updated_at": "2026-10-10T17:54:40.755768+00:00",
   "version": 1,
   "classes": [
     "target_region",

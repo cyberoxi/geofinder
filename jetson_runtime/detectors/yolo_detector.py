@@ -181,6 +181,11 @@ class YOLODetector:
         logger.info("YOLO warmup complete (%d iters)", self.warmup_iterations)
 
     def predict(self, frame: np.ndarray) -> List[Detection]:
+        """Target detections after the per-frame filters (legacy hybrid tracker)."""
+        return self._finalize(self.predict_raw(frame), frame.shape)
+
+    def predict_raw(self, frame: np.ndarray) -> List[Detection]:
+        """Every detection (target + aux objects) in frame pixels, before any filter."""
         if not self.available or self.model is None:
             return []
         t0 = time.perf_counter()
@@ -232,7 +237,7 @@ class YOLODetector:
             if polys is not None and i < len(polys) and len(polys[i]) >= 3:
                 det.polygon = np.asarray(polys[i], np.float32)
             all_dets.append(det)
-        return self._finalize(all_dets, frame.shape)
+        return all_dets
 
     def _finalize(self, all_dets: List[Detection], frame_shape) -> List[Detection]:
         """Keep consistent target detections; if none is strong, infer the target from landmarks."""

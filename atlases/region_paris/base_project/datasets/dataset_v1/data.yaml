@@ -1,0 +1,16 @@
+path: E:\Projects\geofinder\atlases\region_paris\base_project\datasets\dataset_v1
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: target_region
+  1: landmark_1_sports_field
+  2: landmark_2_building
+  3: landmark_3_building
+  4: landmark_4_roundabout
+  5: landmark_5_green_area
+  6: landmark_6_building
+  7: landmark_7_green_area
+  8: landmark_8_building
+  9: landmark_9_building
+nc: 10
