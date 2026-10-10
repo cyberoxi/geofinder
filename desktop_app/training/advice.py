@@ -106,7 +106,7 @@ def _collect_tips(
         tips.append(
             Tip(
                 "high",
-                "PyTorch با پشتیبانی CUDA نصب نیست",
+                "پشتیبانی CUDA در PyTorch نصب نیست",
                 f"کارت {hw['gpu_name']} دیده می‌شود، ولی نسخهٔ فعلی torch از GPU استفاده نمی‌کند. "
                 "نسخهٔ CUDA مربوط به PyTorch را نصب کنید و سپس Train on را روی GPU بگذارید.",
             )
@@ -128,7 +128,7 @@ def _collect_tips(
             tips.append(
                 Tip(
                     "medium",
-                    f"Batch را افزایش دهید (حدود {sug_batch})",
+                    f"افزایش Batch (حدود {sug_batch})",
                     f"حدود {hw['gpu_vram_mb']} مگابایت VRAM دارید و batch فعلی ({batch}) کم است. "
                     f"batch نزدیک {sug_batch} معمولاً آموزش پایدارتر و سریع‌تری می‌دهد.",
                     apply={"batch": sug_batch},
@@ -139,7 +139,7 @@ def _collect_tips(
             tips.append(
                 Tip(
                     "high",
-                    f"Batch را کاهش دهید (حدود {sug_batch})",
+                    f"کاهش Batch (حدود {sug_batch})",
                     f"با حدود {hw['gpu_vram_mb']} مگابایت VRAM، batch برابر {batch} احتمال کمبود حافظه (OOM) دارد. "
                     f"آن را به حدود {sug_batch} برسانید.",
                     apply={"batch": sug_batch},
@@ -150,7 +150,7 @@ def _collect_tips(
             tips.append(
                 Tip(
                     "low",
-                    f"Imgsz را تا {sug_imgsz} افزایش دهید",
+                    f"افزایش Imgsz تا {sug_imgsz}",
                     "اگر VRAM کافی باشد، رزولوشن بالاتر جزئیات ماهواره‌ای را بهتر می‌گیرد.",
                     apply={"imgsz": sug_imgsz},
                 )
@@ -197,7 +197,7 @@ def _collect_tips(
             tips.append(
                 Tip(
                     "medium",
-                    "Recall پایین است",
+                    "پایین بودن Recall",
                     "مدل محتاط است و هدف را کمتر پیدا می‌کند. نمونه‌های مثبت بیشتر، "
                     "Augment بالاتر، یا Epochs بیشتر معمولاً کمک می‌کند.",
                 )
@@ -206,7 +206,7 @@ def _collect_tips(
             tips.append(
                 Tip(
                     "medium",
-                    "Precision پایین است",
+                    "پایین بودن Precision",
                     "مدل بیش از حد تشخیص اشتباه می‌دهد. ویدیوهای منفی (بدون هدف) بیشتری بسازید "
                     "و برچسب‌های نادرست را اصلاح کنید.",
                 )

@@ -34,11 +34,24 @@ _GRADE_COLOR = {
 _PRIO_COLOR = {"high": "#ef4444", "medium": "#eab308", "low": "#64748b"}
 _PRIO_FA = {"high": "مهم", "medium": "متوسط", "low": "کم"}
 
+# Unicode BiDi: force RTL paragraph even when the first strong char is Latin
+# (e.g. "Batch را افزایش دهید" / "PyTorch با …").
+_RLI, _PDI, _RLM = "\u2067", "\u2069", "\u200f"
+
+
+def _force_rtl_text(text: str) -> str:
+    if not text:
+        return text
+    # Already wrapped / marked
+    if text.startswith(_RLI) or text.startswith(_RLM):
+        return text
+    return f"{_RLI}{text}{_PDI}"
+
 
 def _rtl_label(text: str, *, style: str = "", wrap: bool = True) -> QLabel:
-    lbl = QLabel(text)
+    lbl = QLabel(_force_rtl_text(text))
     lbl.setLayoutDirection(Qt.RightToLeft)
-    lbl.setAlignment(Qt.AlignRight | Qt.AlignTop)
+    lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter if not wrap else Qt.AlignRight | Qt.AlignTop)
     if wrap:
         lbl.setWordWrap(True)
     if style:
@@ -66,6 +79,7 @@ class TrainReportDialog(QDialog):
     def __init__(self, report: TrainAdviceReport, parent=None, title: str = "گزارش آموزش / Training Report"):
         super().__init__(parent)
         self.setWindowTitle(title)
+        self.setLayoutDirection(Qt.RightToLeft)
         self.setMinimumSize(720, 560)
         self.resize(820, 640)
         self.report = report

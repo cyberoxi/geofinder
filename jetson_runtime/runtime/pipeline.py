@@ -78,6 +78,7 @@ def build_detector_from_package(loader: PackageLoader) -> Optional[YOLODetector]
         class_names=list(loader.manifest.class_names) if loader.manifest else ["target_region"],
         fallback_paths=fallbacks,
         localizer=localizer,
+        stabilizer_cfg=loader.runtime_config.get("stabilizer"),
     )
 
 
@@ -89,8 +90,14 @@ def draw_landmarks(frame, yolo: Optional[YOLODetector]) -> None:
     if yolo is None:
         return
     names = yolo.class_names
+    rejected = {id(d): why for d, why in yolo.last_rejected}
     for d in yolo.last_all_detections:
-        if d.class_id == yolo.target_class:
+        if id(d) in rejected:
+            x, y, w, h = map(int, d.bbox)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (60, 60, 255), 2)
+            cv2.putText(frame, f"X {rejected[id(d)]}", (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 255), 1, cv2.LINE_AA)
+            continue
+        if d.class_id == yolo.target_class or d.confidence < yolo.confidence_threshold:
             continue
         x, y, w, h = map(int, d.bbox)
         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 160, 255), 2)
@@ -159,7 +166,10 @@ def run_runtime(
         tracker.initialize(frame, initial_roi)
     else:
         ok_init = tracker.initialize_from_search(frame)
-        if not ok_init and loader.manifest and loader.manifest.reference_roi.get("points"):
+        # While the temporal filter is confirming a candidate, keep searching instead of guessing a ROI
+        if tracker.awaiting_confirmation:
+            logger.info("Target candidate seen — confirming over the next frames")
+        elif not ok_init and loader.manifest and loader.manifest.reference_roi.get("points"):
             ref = loader.manifest.reference_roi
             pts = ref["points"]
             # Scale reference polygon if frame size differs
@@ -245,6 +255,7 @@ def run_runtime(
         "yolo": yolo.get_info() if yolo else {"available": False},
         "package": loader.manifest.to_dict() if loader.manifest else {},
         "serial": {k: serial_cfg[k] for k in ("enabled", "port", "baudrate") if k in serial_cfg},
+        "stabilizer": dict(tracker.stabilizer.cfg),
     }
     paths = exporter.finalize(loader.runtime_config, stats, video_path=video_path)
     source.release()

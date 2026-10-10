@@ -510,6 +510,8 @@ class SatelliteVideoDialog(QDialog):
         if enabled:
             self.night_pct.setEnabled(self.use_night.isChecked())
             self.ir_pct.setEnabled(self.use_ir.isChecked())
+            self.btn_cancel.setText("Cancel")
+            self.btn_cancel.setEnabled(True)
         else:
             self.night_pct.setEnabled(False)
             self.ir_pct.setEnabled(False)
@@ -956,13 +958,54 @@ class SatelliteVideoDialog(QDialog):
         self.progress_label.setText(f"Failed: {err}")
         QMessageBox.critical(self, "Satellite Video", err)
 
+    def _disconnect_worker_ui(self) -> None:
+        w = self._worker
+        if w is None:
+            return
+        for sig, slot in (
+            (w.progress, self._on_progress),
+            (w.frame_ready, self._on_frame),
+            (w.finished_ok, self._on_prepared),
+            (w.finished_ok, self._on_worker_done),
+            (w.failed, self._on_worker_failed),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
+    def _force_stop_worker(self) -> None:
+        """Detach UI from a stuck job and stop the thread so the dialog can close."""
+        w = self._worker
+        self._disconnect_worker_ui()
+        self._busy = False
+        self._discard_result = False
+        self._worker = None
+        if w is None:
+            return
+        if w.isRunning():
+            w.finished.connect(w.deleteLater)
+            if not w.wait(2000):
+                w.terminate()
+                w.wait(500)
+        else:
+            w.deleteLater()
+
     def _on_cancel(self) -> None:
-        # Keep dialog open until the worker finishes so a completed run can still
-        # be imported (reject() mid-job used to drop finished_ok → silent loss).
+        # Soft-cancel first so a finished run can still be imported; second Cancel
+        # (or a second window-close) force-stops a stuck worker.
         if self._busy and self._worker and self._worker.isRunning():
+            if self._discard_result:
+                self.progress_label.setText("Force closing…")
+                self._force_stop_worker()
+                self.reject()
+                return
             self._discard_result = True
-            self.progress_label.setText("Cancelling… wait for current job to finish")
-            self.btn_cancel.setEnabled(False)
+            self.progress_label.setText(
+                "Cancelling… wait for current job, or click Cancel again to force close"
+            )
+            self.btn_cancel.setText("Force Close")
+            self.btn_cancel.setEnabled(True)
             self.btn_generate.setEnabled(False)
             try:
                 self._worker.progress.disconnect(self._on_progress)
@@ -974,15 +1017,15 @@ class SatelliteVideoDialog(QDialog):
 
     def closeEvent(self, event):  # noqa: N802
         if self._busy and self._worker and self._worker.isRunning():
-            # Same as Cancel: wait for worker; do not destroy mid-job
-            self._on_cancel()
-            event.ignore()
-            return
+            if self._discard_result:
+                self._force_stop_worker()
+            else:
+                self._on_cancel()
+                event.ignore()
+                return
         self._persist_selection()
         self.mini_strip.shutdown()
-        ov = getattr(self.map_panel, "overview", None)
-        if ov is not None:
-            ov.shutdown()
+        self.map_panel.shutdown()
         super().closeEvent(event)
 
     def params(self, require_map: bool = True) -> Dict[str, Any]:

@@ -16,6 +16,7 @@ from jetson_runtime.trackers.optical_flow_tracker import BoxTracker, OpticalFlow
 from shared.features import FeatureExtractor, verify_detection_with_features
 from shared.geometry import is_valid_roi, scale_from_polygons
 from shared.logging import get_logger
+from shared.target_stabilizer import CONFIRMING, Candidate, TargetStabilizer
 from shared.schemas import (
     FrameResult,
     ROI,
@@ -89,6 +90,9 @@ class MultiScaleHybridTracker:
         )
         self.smoothing_enabled = bool(scfg.get("enabled", True))
         self.min_iou = float(tcfg.get("min_iou", 0.20))
+        # False-target filter: YOLO hits must be confirmed / inside the motion gate
+        self.stabilizer = TargetStabilizer(config.get("stabilizer"))
+        self.filter_state = "searching"
 
         self.state = TrackerState(status=RuntimeState.INIT)
         self._frame_idx = 0
@@ -182,7 +186,7 @@ class MultiScaleHybridTracker:
 
                     combined += 0.2 * iou_bbox(d.bbox, self.state.roi.bbox)
                 if ok or self.reference_descriptors is None:
-                    candidates.append((combined, roi, d.confidence, inl))
+                    candidates.append((combined, roi, d.confidence, inl, d))
         if not candidates:
             # If no feature verify, still take best YOLO via confidence manager
             dets = self.yolo.predict(frame)
@@ -193,23 +197,46 @@ class MultiScaleHybridTracker:
                 best = self.confidence_mgr.select_detection(
                     dets, None, self.confidence_mgr.confidence_threshold, iou_threshold=0.0
                 )
-            if best is None:
-                return None
-            roi = self.yolo.detection_to_roi(best, self._frame_idx)
-            self.state.confidence = best.confidence
-            self.state.method = TrackingMethod.YOLO_SEG if self.yolo.mode == "segmentation" else TrackingMethod.YOLO
-            self.stats["yolo"] += 1
-            self.stats["redetect"] += 1
-            return roi
+            if best is not None:
+                roi = self.yolo.detection_to_roi(best, self._frame_idx)
+                candidates.append((best.confidence, roi, best.confidence, 0, best))
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        combined, roi, conf, inl = candidates[0]
+        picked = self._stabilize(candidates)
+        if picked is None:
+            return None
+        combined, roi, conf, inl, _ = picked
         self.state.confidence = float(conf)
         self.state.inlier_count = int(inl)
         self.state.method = TrackingMethod.YOLO_SEG if self.yolo and self.yolo.mode == "segmentation" else TrackingMethod.YOLO
         self.stats["yolo"] += 1
         self.stats["redetect"] += 1
         return roi
+
+    @property
+    def awaiting_confirmation(self) -> bool:
+        """A YOLO candidate is being confirmed by the temporal filter (not locked yet)."""
+        return self.filter_state == CONFIRMING
+
+    def _stabilize(self, candidates: List[Tuple[float, ROI, float, int, Any]]):
+        """Let the temporal filter pick (or veto) one of this frame's YOLO candidates."""
+        min_conf = self.yolo.confidence_threshold if self.yolo is not None else 0.45
+        cands = [
+            Candidate(
+                roi.points,
+                float(conf),
+                getattr(d, "source", "yolo"),
+                int(getattr(d, "n_landmarks", 0)),
+                score=float(combined),
+            )
+            for combined, roi, conf, _, d in candidates
+        ]
+        st = self.stabilizer.update(cands, min_conf, self._frame_idx)
+        self.filter_state = st.state
+        if st.chosen is None:
+            if candidates:
+                logger.debug("YOLO candidate held back by filter: %s %s %s", st.state, st.progress, st.reason)
+            return None
+        return candidates[st.chosen]
 
     def update(self, frame: np.ndarray, frame_idx: Optional[int] = None) -> TrackerState:
         if frame_idx is not None:
@@ -322,6 +349,7 @@ class MultiScaleHybridTracker:
         self.state.inlier_count = int(inliers)
         self.state.reprojection_error = float(reproj)
         self.state.lost_count = 0
+        self.stabilizer.follow(roi.points, self._frame_idx)
         if self.state.status != RuntimeState.SCALE_CHANGE:
             self.state.status = (
                 RuntimeState.RE_DETECTING if self.confidence_mgr.is_low(conf) else RuntimeState.TRACKING

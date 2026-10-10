@@ -43,6 +43,40 @@ from shared.usb_transfer import (
 class PipelineActionsMixin:
     """Expects DesktopMainWindow attributes: project, log, _set_task_progress, …"""
 
+    def _has_trained_model(self) -> bool:
+        """True if this project/target already has a completed training run."""
+        if not self.project:
+            return False
+        runs = self.project.runs_dir
+        if any(runs.glob("**/weights/best.pt")):
+            return True
+        return (runs / "train_summary.json").exists()
+
+    def _confirm_replace_previous_train(self, kind: str = "train") -> bool:
+        """Ask before overwriting an existing model. Returns True if OK to proceed."""
+        if not self._has_trained_model():
+            return True
+        target = ""
+        if self.project and self.project.meta:
+            target = (self.project.meta.project_name or self.project.meta.target_class or "").strip()
+        name = f" «{target}»" if target else ""
+        if kind == "pipeline":
+            title = "Pipeline — Retrain / آموزش مجدد"
+            what = "اجرای کامل پایپ‌لاین (شامل آموزش)"
+            what_en = "Running the full pipeline (including training)"
+        else:
+            title = "Train — Retrain / آموزش مجدد"
+            what = "آموزش مجدد"
+            what_en = "Retraining"
+        msg = (
+            f"این تارگت{name} قبلاً آموزش دیده است.\n"
+            f"{what} مدل قبلی را جایگزین می‌کند.\n\n"
+            f"This target{name} is already trained.\n"
+            f"{what_en} will replace the previous model.\n\n"
+            "ادامه؟ / Continue?"
+        )
+        return QMessageBox.question(self, title, msg) == QMessageBox.Yes
+
     def run_full_pipeline(self):
         if not self.project:
             QMessageBox.warning(self, "Pipeline", "Create or open a project first")
@@ -106,6 +140,8 @@ class PipelineActionsMixin:
         if src and self.project.meta and cfg.model_type == self.project.meta.model_type:
             cfg.base_model, cfg.freeze = src
             self.log(f"Region-atlas sub-region: fine-tuning from {cfg.base_model}", "ok")
+        if not self._confirm_replace_previous_train("pipeline"):
+            return
         self._start_pipeline(cfg)
 
     def _start_pipeline(self, cfg: AutoPipelineConfig, on_done=None):
@@ -174,8 +210,11 @@ class PipelineActionsMixin:
             self._log_file("evaluation video", m.get("output_video"))
         self._log_file("summary", summary.get("summary_path"))
         self.log(f"Total time: {summary.get('elapsed_sec', '?')} s", "ok")
-        self.btn_pipeline.setText("  Run Full Pipeline")
-        self.btn_pipeline.setIcon(get_icon("pipeline"))
+        if hasattr(self, "_refresh_train_status"):
+            self._refresh_train_status()
+        else:
+            self.btn_pipeline.setText("  Run Full Pipeline")
+            self.btn_pipeline.setIcon(get_icon("pipeline"))
         self.statusBar().showMessage("Pipeline finished")
         lines = []
         if summary.get("package"):
@@ -203,8 +242,11 @@ class PipelineActionsMixin:
         self.log(f"Pipeline failed: {err}", "error")
         self.task_progress.setRange(0, 100)
         self.task_stage.setText("Failed / خطا")
-        self.btn_pipeline.setText("  Run Full Pipeline")
-        self.btn_pipeline.setIcon(get_icon("pipeline"))
+        if hasattr(self, "_refresh_train_status"):
+            self._refresh_train_status()
+        else:
+            self.btn_pipeline.setText("  Run Full Pipeline")
+            self.btn_pipeline.setIcon(get_icon("pipeline"))
         chart = getattr(self, "train_chart", None)
         if chart is not None and getattr(self, "_train_chart_armed", False):
             chart.mark_done(False)
@@ -592,6 +634,8 @@ class PipelineActionsMixin:
                 "Then restart the app.",
             )
             return
+        if not self._confirm_replace_previous_train("train"):
+            return
 
         from desktop_app.pipeline.auto import resolve_device
 
@@ -627,18 +671,18 @@ class PipelineActionsMixin:
         self.statusBar().showMessage("Training…")
 
     def _show_video_canvas(self) -> None:
-        stack = getattr(self, "mid_stack", None)
-        if stack is not None:
-            stack.setCurrentIndex(0)
+        tabs = getattr(self, "mid_tabs", None)
+        if tabs is not None:
+            tabs.setCurrentIndex(getattr(self, "_tab_video", 0))
 
     def _begin_live_train_chart(self, total_epochs: int = 0) -> None:
         chart = getattr(self, "train_chart", None)
-        stack = getattr(self, "mid_stack", None)
-        if chart is None or stack is None:
+        tabs = getattr(self, "mid_tabs", None)
+        if chart is None or tabs is None:
             return
         self.pause()
         chart.reset(int(total_epochs or 0))
-        stack.setCurrentWidget(chart)
+        tabs.setCurrentIndex(getattr(self, "_tab_train", 1))
         self._train_chart_armed = True
 
     def _feed_train_chart_progress(self, d: Optional[dict]) -> None:
@@ -701,6 +745,8 @@ class PipelineActionsMixin:
             if lm.get("metrics"):
                 self._feed_train_chart_progress(lm)
         self._train_chart_armed = False
+        if hasattr(self, "_refresh_train_status"):
+            self._refresh_train_status()
         applied = show_train_report(
             self,
             result,

@@ -93,6 +93,13 @@ class PackageBuilder:
         runtime["yolo"]["model_path"] = "model/model.engine" if has_engine else (
             "model/model.onnx" if has_onnx else "model/best.pt"
         )
+        # False-target filters as set in Tools → Detection Filters (same as Live Test)
+        try:
+            from desktop_app.gui.stabilizer_dialog import load_stabilizer_settings
+
+            runtime["stabilizer"] = load_stabilizer_settings()
+        except Exception:  # noqa: BLE001 — no Qt available: keep defaults
+            pass
         save_yaml(runtime, staging / "config" / "runtime.yaml")
 
         class_names = self.project.class_names()

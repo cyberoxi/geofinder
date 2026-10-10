@@ -256,6 +256,7 @@ class Detection:
     polygon: Optional[np.ndarray] = None
     mask: Optional[np.ndarray] = None
     source: str = "yolo"  # "yolo" or "landmarks" (target inferred from landmark geometry)
+    n_landmarks: int = 0  # aux objects behind a "landmarks" detection
 
 
 @dataclass

@@ -86,6 +86,25 @@ DEFAULT_RUNTIME = {
         "send_when_lost": False,
         "line_format": "{dx},{dy}\n",
     },
+    # False-target suppression (shared/target_filter.py + shared/target_stabilizer.py).
+    # Edited on the desktop (Tools → Detection Filters) and shipped inside the package.
+    "stabilizer": {
+        # 1) Target must agree with the position predicted from aux objects (landmarks)
+        "geometry_check": True,
+        "geometry_max_center_err": 0.8,  # × expected target size
+        "geometry_max_size_ratio": 2.0,  # detected / expected size outside [1/r, r] → reject
+        # 2) Temporal confirmation (N of M) + hysteresis + motion gate
+        "temporal": True,
+        "confirm_hits": 3,
+        "confirm_window": 5,
+        "hold_conf_ratio": 0.7,  # once locked, keep down to min_conf × this
+        "gate_ratio": 1.5,  # gate radius × target size around the predicted position
+        "gate_min_px": 40.0,
+        "coast_frames": 8,  # frames to keep the lock on prediction when the detector misses
+        # 3) Aux objects must fit the scene layout; one alone cannot acquire the target
+        "landmark_consistency": True,
+        "min_landmarks_acquire": 2,
+    },
 }
 
 

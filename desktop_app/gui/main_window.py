@@ -20,6 +20,7 @@ from shared.theme import apply_theme, style_brand_label
 from shared.qt_compat import (
     Qt,
     QAction,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -34,7 +35,7 @@ from shared.qt_compat import (
     QSettings,
     QSlider,
     QSplitter,
-    QStackedWidget,
+    QTabWidget,
     QTimer,
     QToolBar,
     QVBoxLayout,
@@ -62,6 +63,7 @@ from desktop_app.gui.pipeline_actions import PipelineActionsMixin
 from desktop_app.gui.atlas_actions import AtlasActionsMixin
 from desktop_app.gui.offline_actions import OfflineActionsMixin
 from desktop_app.gui.serial_actions import SerialActionsMixin
+from desktop_app.gui.training_help import make_setting_label
 
 
 class DesktopMainWindow(
@@ -111,10 +113,17 @@ class DesktopMainWindow(
             self.project = ProjectManager.open(path)
             self._refresh_videos()
             self._update_window_title()
+            self._refresh_train_status()
             self.status_box.setText(f"Opened {path}")
             self.statusBar().showMessage(f"Restored project: {path}")
         except Exception:  # noqa: BLE001
             pass
+
+    def edit_detection_filters(self) -> None:
+        from desktop_app.gui.stabilizer_dialog import describe_stabilizer, edit_stabilizer_settings
+
+        cfg = edit_stabilizer_settings(self)
+        self.log(f"Detection {describe_stabilizer(cfg)} (applies to Live Test + next package)", "head")
 
     def _tb_action(
         self,
@@ -159,11 +168,12 @@ class DesktopMainWindow(
         self.act_add = self._tb_action(
             "Add Video", "add_video", self.add_video, "Add a video to the project", "Ctrl+Shift+V"
         )
-        self.act_play = self._tb_action("Play", "play", self.play, "Play / stop current video", "Space")
+        self.act_play = self._tb_action("Play", "play", self.play, "Play / pause current video", "Space")
         self.act_pause = self._tb_action("Pause", "pause", self.pause, "Pause playback")
+        self.act_stop = self._tb_action("Stop", "stop", self.stop, "Stop and go to start of video")
         self.act_prev = self._tb_action("Prev", "prev", self.prev_frame, "Previous frame", "Left")
         self.act_next = self._tb_action("Next", "next", self.next_frame, "Next frame", "Right")
-        self.btn_play = None  # set in transport bar; toggles Play ↔ Stop
+        self.btn_play = None  # set in transport bar; toggles Play ↔ Pause
         self.act_sat = self._tb_action(
             "Satellite", "satellite", self.generate_satellite_video, "Generate satellite training videos"
         )
@@ -205,8 +215,8 @@ class DesktopMainWindow(
             "Validate", "validate", self.validate_pkg, "Validate package ZIP"
         )
 
-        # Play/Pause/Prev/Next live under the video canvas (not on the toolbar).
-        for act in (self.act_play, self.act_pause, self.act_prev, self.act_next):
+        # Play/Pause/Stop/Prev/Next live under the video canvas (not on the toolbar).
+        for act in (self.act_play, self.act_pause, self.act_stop, self.act_prev, self.act_next):
             self.addAction(act)
 
         self._tb_primary = [
@@ -347,6 +357,12 @@ class DesktopMainWindow(
             self._tb_action("Live Test Model on Video…", "test", self.test_model_on_video)
         )
         tools_menu.addAction(
+            self._tb_action(
+                "Detection Filters… / فیلتر تشخیص اشتباه", "settings", self.edit_detection_filters,
+                tip="False-target filters for Live Test and the Jetson package",
+            )
+        )
+        tools_menu.addAction(
             self._tb_action("Copy Package to USB…", "usb", self.transfer_package_to_usb)
         )
 
@@ -415,19 +431,21 @@ class DesktopMainWindow(
         mid = QWidget()
         mv = QVBoxLayout(mid)
         mv.setContentsMargins(4, 4, 4, 4)
-        self.mid_stack = QStackedWidget()
+        self.mid_tabs = QTabWidget()
+        self.mid_tabs.setDocumentMode(True)
+
+        video_tab = QWidget()
+        vv = QVBoxLayout(video_tab)
+        vv.setContentsMargins(4, 4, 4, 4)
+        vv.setSpacing(6)
         self.canvas = FrameCanvas()
         self.canvas.roi_done.connect(self._on_roi)
-        self.train_chart = TrainLiveChart()
-        self.train_chart.btn_back.clicked.connect(self._show_video_canvas)
-        self.mid_stack.addWidget(self.canvas)
-        self.mid_stack.addWidget(self.train_chart)
-        mv.addWidget(self.mid_stack, stretch=1)
+        vv.addWidget(self.canvas, stretch=1)
 
         transport = QHBoxLayout()
         transport.setSpacing(6)
         transport.addStretch(1)
-        for act in (self.act_prev, self.act_play, self.act_next):
+        for act in (self.act_prev, self.act_play, self.act_stop, self.act_next):
             btn = QPushButton(act.icon(), act.text())
             btn.setToolTip(act.toolTip() or act.text())
             btn.setMinimumHeight(32)
@@ -437,7 +455,7 @@ class DesktopMainWindow(
                 self.btn_play = btn
             transport.addWidget(btn)
         transport.addStretch(1)
-        mv.addLayout(transport)
+        vv.addLayout(transport)
 
         tl = QHBoxLayout()
         tl.setSpacing(8)
@@ -451,14 +469,21 @@ class DesktopMainWindow(
         tl.addWidget(self.slider, stretch=1)
         tl.addWidget(frame_lbl)
         tl.addWidget(self.frame_spin)
-        mv.addLayout(tl)
+        vv.addLayout(tl)
         self.preview = QLabel("ROI preview")
         self.preview.setFixedHeight(110)
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet(
             "background:#0b1220;color:#64748b;border:1px solid #243041;border-radius:8px;"
         )
-        mv.addWidget(self.preview)
+        vv.addWidget(self.preview)
+
+        self.train_chart = TrainLiveChart()
+        self.mid_tabs.addTab(video_tab, "Video / ویدیو")
+        self.mid_tabs.addTab(self.train_chart, "Training / آموزش")
+        self._tab_video = 0
+        self._tab_train = 1
+        mv.addWidget(self.mid_tabs, stretch=1)
         splitter.addWidget(mid)
 
         right = QWidget()
@@ -508,6 +533,15 @@ class DesktopMainWindow(
         )
         self.device.currentIndexChanged.connect(self._on_device_changed)
         form.addRow("Train on", self.device)
+        self.train_status = QLabel("آموزش انجام نشده / Not trained yet")
+        self.train_status.setWordWrap(True)
+        self.train_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.train_status.setMinimumHeight(52)
+        self.train_status.setStyleSheet(
+            "color:#94a3b8;font-size:12px;padding:10px 10px;"
+            "background:#151b24;border:1px solid #243041;border-radius:6px;"
+        )
+        form.addRow(self.train_status)
         rv.addWidget(box)
 
         self.btn_train = None
@@ -616,10 +650,12 @@ class DesktopMainWindow(
             self._remember_project(path)
             self._refresh_videos()
             self._update_window_title()
+            self._refresh_train_status()
             self.status_box.setText(f"Created project at {path}")
         except Exception as exc:  # noqa: BLE001
             self.project = None
             self._update_window_title()
+            self._refresh_train_status()
             QMessageBox.critical(self, "Error", str(exc))
 
     def open_project(self):
@@ -638,11 +674,13 @@ class DesktopMainWindow(
             self._remember_project(path)
             self._refresh_videos()
             self._update_window_title()
+            self._refresh_train_status()
             self.status_box.setText(f"Opened {path}")
             return True
         except Exception as exc:  # noqa: BLE001
             self.project = None
             self._update_window_title()
+            self._refresh_train_status()
             QMessageBox.critical(self, "Error", str(exc))
             return False
 
@@ -863,6 +901,100 @@ class DesktopMainWindow(
         if self.video_list.count() == 0:
             self._unload_video()
 
+    def _refresh_train_status(self) -> None:
+        """Show whether this target is trained; next train replaces the previous model."""
+        trained = bool(self.project) and self._has_trained_model()
+        lbl = getattr(self, "train_status", None)
+        if lbl is not None:
+            style_idle = (
+                "color:#94a3b8;font-size:12px;padding:10px 10px;"
+                "background:#151b24;border:1px solid #243041;border-radius:6px;"
+            )
+            style_ok = (
+                "color:#5eead4;font-size:12px;padding:10px 10px;"
+                "background:#0f2a28;border:1px solid #134e4a;border-radius:6px;"
+            )
+            if not self.project:
+                lbl.setText("آموزش انجام نشده / Not trained yet")
+                lbl.setStyleSheet(style_idle)
+                lbl.setMinimumHeight(52)
+                lbl.setToolTip("")
+            elif trained:
+                name = ""
+                if self.project.meta:
+                    name = (self.project.meta.project_name or "").strip()
+                who = f" برای «{name}»" if name else ""
+                # Two lines + padding so the box height is stable in the right panel
+                lbl.setText(
+                    f"✓ آموزش انجام شده{who}\n"
+                    "ترین بعدی جایگزین قبلی می‌شود · replaces previous"
+                )
+                lbl.setStyleSheet(style_ok)
+                lbl.setMinimumHeight(72)
+                lbl.setToolTip(
+                    "A model already exists for this target. "
+                    "Train or Run Full Pipeline will overwrite the previous weights."
+                )
+            else:
+                lbl.setText("آموزش انجام نشده / Not trained yet")
+                lbl.setStyleSheet(style_idle)
+                lbl.setMinimumHeight(52)
+                lbl.setToolTip("Train or Run Full Pipeline to create the first model for this target.")
+            lbl.adjustSize()
+            lbl.updateGeometry()
+            box = lbl.parentWidget()
+            if box is not None:
+                box.updateGeometry()
+
+        pipe_running = (
+            getattr(self, "_pipeline_worker", None) is not None
+            and self._pipeline_worker.isRunning()
+        )
+        if getattr(self, "btn_pipeline", None) is not None and not pipe_running:
+            if trained:
+                self.btn_pipeline.setText("  Run Full Pipeline (retrain)")
+                self.btn_pipeline.setToolTip(
+                    "Dataset → Train → ONNX → Jetson package → evaluation\n"
+                    "Already trained — this run replaces the previous model / "
+                    "آموزش قبلی جایگزین می‌شود"
+                )
+            else:
+                self.btn_pipeline.setText("  Run Full Pipeline")
+                self.btn_pipeline.setToolTip("Dataset → Train → ONNX → Jetson package → evaluation")
+            self.btn_pipeline.setIcon(get_icon("pipeline"))
+
+        if getattr(self, "btn_train", None) is not None:
+            if trained:
+                self.btn_train.setText("  Retrain YOLO (replaces previous)")
+                self.btn_train.setToolTip(
+                    "Train again — overwrites the previous weights for this target / "
+                    "آموزش مجدد؛ مدل قبلی جایگزین می‌شود"
+                )
+            else:
+                self.btn_train.setText("  Train YOLO")
+                self.btn_train.setToolTip("Train YOLO model")
+
+        act = getattr(self, "act_train", None)
+        if act is not None:
+            if trained:
+                act.setText("Retrain")
+                act.setToolTip(
+                    "Retrain — replaces previous model / آموزش مجدد جایگزین مدل قبلی"
+                )
+            else:
+                act.setText("Train")
+                act.setToolTip("Train YOLO model")
+
+        act_pipe = getattr(self, "act_pipeline", None)
+        if act_pipe is not None and not pipe_running:
+            if trained:
+                act_pipe.setToolTip(
+                    "Full pipeline — retrain replaces previous model / "
+                    "ترین بعدی جایگزین قبلی"
+                )
+            else:
+                act_pipe.setToolTip("Dataset → Train → ONNX → Jetson package")
+
     def _on_video_selected(self, row: int):
         if row < 0 or not self.project or not self.project.meta:
             self._unload_video()
@@ -927,7 +1059,7 @@ class DesktopMainWindow(
             self.preview.setText("Preview unavailable")
 
     def play(self):
-        """Toggle: start playback, or stop if already playing."""
+        """Toggle: start playback, or pause if already playing."""
         if self._timer.isActive():
             self.pause()
             return
@@ -940,12 +1072,18 @@ class DesktopMainWindow(
         self._timer.stop()
         self._set_play_button(playing=False)
 
+    def stop(self):
+        """Stop playback and jump to the first frame."""
+        self.pause()
+        if self.reader:
+            self.slider.setValue(0)
+
     def _set_play_button(self, playing: bool):
         if playing:
-            tip = "Stop playback"
-            text, icon = "Stop", get_icon("stop")
+            tip = "Pause playback"
+            text, icon = "Pause", get_icon("pause")
         else:
-            tip = "Play / stop current video"
+            tip = "Play / pause current video"
             text, icon = "Play", get_icon("play")
         self.act_play.setText(text)
         self.act_play.setIcon(icon)

@@ -11,6 +11,8 @@ import numpy as np
 
 from shared.logging import get_logger
 from shared.schemas import Detection, ROI
+from shared.target_filter import filter_frame
+from shared.target_stabilizer import detector_conf, merge_stabilizer_config
 
 logger = get_logger("grt.yolo")
 
@@ -40,6 +42,7 @@ class YOLODetector:
         class_names: Optional[List[str]] = None,
         fallback_paths: Optional[List[str]] = None,
         localizer: Optional[Any] = None,
+        stabilizer_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.mode = mode.lower()
         self.device_pref = device
@@ -60,8 +63,14 @@ class YOLODetector:
         self._fallback_paths = fallback_paths or []
         # Landmark-based target localization (shared.landmarks.TargetLocalizer)
         self.localizer = localizer
+        if localizer is not None:
+            localizer.min_confidence = confidence_threshold
+        # False-target filters (package runtime.yaml → stabilizer); temporal part lives in the tracker
+        self.stabilizer_cfg = merge_stabilizer_config(stabilizer_cfg)
+        self.predict_conf = detector_conf(confidence_threshold, self.stabilizer_cfg)
         self.last_all_detections: List[Detection] = []
         self.last_localization: Optional[Any] = None
+        self.last_rejected: List[Any] = []
         self.predict_count = 0
         self._load_model()
 
@@ -172,7 +181,7 @@ class YOLODetector:
             results = self.model.predict(
                 frame,
                 imgsz=self.imgsz,
-                conf=self.confidence_threshold,
+                conf=self.predict_conf,
                 iou=self.iou_threshold,
                 device=self.device,
                 half=self.use_fp16 and self.device != "cpu",
@@ -224,22 +233,25 @@ class YOLODetector:
         return self._finalize(all_dets, frame.shape)
 
     def _finalize(self, all_dets: List[Detection], frame_shape) -> List[Detection]:
-        """Keep target detections; if none, infer the target from visible landmarks."""
+        """Keep consistent target detections; if none is strong, infer the target from landmarks."""
         self.predict_count += 1
         self.last_all_detections = all_dets
         self.last_localization = None
+        self.last_rejected = []
         multi = len(self.class_names) > 1
         if not multi or self.target_class < 0:
             return all_dets
-        targets = [d for d in all_dets if d.class_id == int(self.target_class)]
         if self.localizer is None:
-            return targets
-        best_target = max((d.confidence for d in targets), default=0.0)
-        est = self.localizer.estimate(all_dets, frame_shape)
+            return [d for d in all_dets if d.class_id == int(self.target_class)]
+        flt = filter_frame(all_dets, self.localizer, frame_shape, self.stabilizer_cfg, self.confidence_threshold)
+        targets, est = flt.targets, flt.estimate
         self.last_localization = est
+        self.last_rejected = flt.rejected
+        for det, why in flt.rejected:
+            logger.debug("Filtered class %d conf=%.2f: %s", det.class_id, det.confidence, why)
         if est is None or not est.in_view:
             return targets
-        if best_target >= self.confidence_threshold:
+        if targets and targets[0].confidence >= self.confidence_threshold:
             return targets
         poly = est.polygon.astype(np.float32)
         x0, y0 = float(poly[:, 0].min()), float(poly[:, 1].min())
@@ -250,6 +262,7 @@ class YOLODetector:
             class_id=int(self.target_class),
             polygon=poly,
             source="landmarks",
+            n_landmarks=len(est.landmarks_used),
         )
         logger.debug(
             "Target inferred from landmarks %s conf=%.2f scale=%.3f angle=%.1f",

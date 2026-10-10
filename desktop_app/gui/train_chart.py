@@ -7,13 +7,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from shared.qt_compat import (
     QColor,
     QFont,
-    QHBoxLayout,
     QLabel,
     QPainter,
     QPen,
     QPointF,
     QPolygonF,
-    QPushButton,
     Qt,
     QVBoxLayout,
     QWidget,
@@ -222,15 +220,9 @@ class TrainLiveChart(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
 
-        head = QHBoxLayout()
         self.title = QLabel("Learning progress / پیشرفت یادگیری")
         self.title.setStyleSheet("color:#e2e8f0;font-weight:600;font-size:14px;")
-        head.addWidget(self.title, stretch=1)
-        self.btn_back = QPushButton("Back to video")
-        self.btn_back.setToolTip("بازگشت به نمایش ویدیو")
-        self.btn_back.setFixedHeight(28)
-        head.addWidget(self.btn_back)
-        root.addLayout(head)
+        root.addWidget(self.title)
 
         self.subtitle = QLabel("Training…")
         self.subtitle.setStyleSheet("color:#94a3b8;")

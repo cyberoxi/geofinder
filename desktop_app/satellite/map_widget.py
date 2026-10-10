@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from desktop_app.satellite.geocode import GeocodeHit, search_places
+from desktop_app.satellite.map_load_status import MapLoadStatusBar
 from desktop_app.satellite.scene import meters_per_pixel
 from desktop_app.satellite.tiles import (
     LAYERS,
@@ -266,6 +267,8 @@ class SatelliteMapWidget(QLabel):
 
     view_changed = Signal()
     selection_changed = Signal()
+    # active, done, total, message — for MapLoadStatusBar under every map panel
+    loading_changed = Signal(bool, int, int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -309,6 +312,8 @@ class SatelliteMapWidget(QLabel):
         self._pending_keys: Set[TileKey] = set()
         self._failed: Dict[TileKey, float] = {}  # key → time of failure (retry later, no endless loop)
         self._loading = False
+        self._load_done = 0
+        self._load_total = 0
 
         # Ground elevation (m ASL) at map center — fetched lazily
         self._ground_elev_m: Optional[float] = None
@@ -439,6 +444,39 @@ class SatelliteMapWidget(QLabel):
         """Show a dashed, non-editable outline (e.g. the boundary of a region atlas)."""
         self._ref_poly = [(float(lon), float(lat)) for lon, lat in (points or [])]
         self.update()
+
+    def shutdown(self) -> None:
+        """Cancel tile/elevation workers before the parent dialog is destroyed."""
+        self._elev_timer.stop()
+        tw = self._tile_worker
+        if tw is not None and tw.isRunning():
+            tw.cancel()
+        ew = self._elev_worker
+        if ew is not None and ew.isRunning():
+            try:
+                ew.finished_ok.disconnect(self._on_elevation_ok)
+                ew.failed.disconnect(self._on_elevation_failed)
+            except (TypeError, RuntimeError):
+                pass
+            ew.finished.connect(ew.deleteLater)
+            if not ew.wait(1500):
+                ew.terminate()
+                ew.wait(300)
+            self._elev_worker = None
+        if tw is not None and tw.isRunning():
+            try:
+                tw.tile_done.disconnect(self._on_tile_done)
+                tw.finished_ok.disconnect(self._on_tiles_ready)
+                tw.failed.disconnect(self._on_tiles_failed)
+            except (TypeError, RuntimeError):
+                pass
+            tw.finished.connect(tw.deleteLater)
+            if not tw.wait(2000):
+                tw.terminate()
+                tw.wait(300)
+            self._tile_worker = None
+        self._loading = False
+        self._pending_keys.clear()
 
     def reference_contains(self, lon: float, lat: float) -> bool:
         """True when (lon, lat) is inside the reference outline (or no outline is set)."""
@@ -602,8 +640,12 @@ class SatelliteMapWidget(QLabel):
         canvas[:] = (30, 30, 30)
 
         if not self._tiles_enabled:
+            was_loading = self._loading
             self._loading = False
             self._pending_keys.clear()
+            self._load_done = self._load_total = 0
+            if was_loading:
+                self._emit_loading(False, "Imagery disabled")
             msg = "Tick a satellite service to show imagery"
             cv2.putText(
                 canvas, msg, (max(10, w // 2 - 200), h // 2),
@@ -689,8 +731,15 @@ class SatelliteMapWidget(QLabel):
         if missing:
             self._queue_tile_fetch(missing)
         else:
+            was_loading = self._loading
             self._loading = False
             self._pending_keys.clear()
+            if was_loading:
+                self._load_done = self._load_total
+                self._emit_loading(False, f"Map ready  [{self.basemap} z{self.zoom}]")
+
+    def _emit_loading(self, active: bool, message: str) -> None:
+        self.loading_changed.emit(active, self._load_done, self._load_total, message)
 
     def _queue_tile_fetch(self, keys: List[TileKey]) -> None:
         needed = set(keys)
@@ -701,8 +750,14 @@ class SatelliteMapWidget(QLabel):
             self._tile_worker.cancel()
         self._pending_keys = needed
         self._loading = True
+        self._load_total = len(needed)
+        self._load_done = 0
         self._tile_req_id += 1
         req_id = self._tile_req_id
+        self._emit_loading(
+            True,
+            f"Loading map… 0/{self._load_total}  [{self.basemap} z{self.zoom}]",
+        )
         worker = TileFetchWorker(req_id, list(needed), self.cache_dir, parent=self)
         worker.tile_done.connect(self._on_tile_done)
         worker.finished_ok.connect(self._on_tiles_ready)
@@ -711,10 +766,21 @@ class SatelliteMapWidget(QLabel):
         worker.start()
 
     def _on_tile_done(self, request_id: int, key: object, ok: bool) -> None:
+        if request_id != self._tile_req_id:
+            return
         if not ok:
             self._failed[tuple(key)] = time.time()
         else:
             self._failed.pop(tuple(key), None)
+        self._load_done = min(self._load_total, self._load_done + 1)
+        tk = tuple(key)
+        z, layer = int(tk[0]), str(tk[3])
+        tag = "ok" if ok else "fail"
+        self._emit_loading(
+            True,
+            f"Loading map… {self._load_done}/{self._load_total}  "
+            f"[{layer} z{z}] {tag}",
+        )
         # Repaint progressively (coalesced by the single-shot timer)
         if not self._refresh_timer.isActive():
             self._refresh_timer.start(120)
@@ -726,13 +792,16 @@ class SatelliteMapWidget(QLabel):
             return
         self._loading = False
         self._pending_keys.clear()
+        self._load_done = self._load_total
+        self._emit_loading(False, f"Map ready  [{self.basemap} z{self.zoom}]")
         self._schedule_render()
 
-    def _on_tiles_failed(self, request_id: int, _err: str) -> None:
+    def _on_tiles_failed(self, request_id: int, err: str) -> None:
         if request_id != self._tile_req_id:
             return
         self._loading = False
         self._pending_keys.clear()
+        self._emit_loading(False, f"Map load failed: {err}")
         self._schedule_render()
 
     def _draw_numbered_poly(
@@ -1279,6 +1348,10 @@ class SatelliteMapPanel(QWidget):
         self.overview.jump_requested.connect(self._overview_jump)
         layout.addWidget(self._map_host, stretch=1)
 
+        self.load_status = MapLoadStatusBar(self)
+        layout.addWidget(self.load_status)
+        self.map.loading_changed.connect(self.load_status.on_loading)
+
         self._hits: List[GeocodeHit] = []
         self._geo_worker: Optional[GeocodeWorker] = None
 
@@ -1460,6 +1533,25 @@ class SatelliteMapPanel(QWidget):
         if ov is not None:
             ov.refresh_offline_boxes()
             self._sync_overview()
+
+    def shutdown(self) -> None:
+        """Stop search / map / overview workers before the dialog closes."""
+        gw = self._geo_worker
+        self._geo_worker = None
+        if gw is not None and gw.isRunning():
+            try:
+                gw.finished_ok.disconnect(self._on_search_ok)
+                gw.failed.disconnect(self._on_search_failed)
+            except (TypeError, RuntimeError):
+                pass
+            gw.finished.connect(gw.deleteLater)
+            if not gw.wait(2000):
+                gw.terminate()
+                gw.wait(300)
+        self.map.shutdown()
+        ov = getattr(self, "overview", None)
+        if ov is not None:
+            ov.shutdown()
 
     def _overview_jump(self, lat: float, lon: float) -> None:
         self.map.go_to(lat, lon)

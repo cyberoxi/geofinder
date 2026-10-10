@@ -22,6 +22,9 @@ Dual app: **desktop_app/** (dataset + package) and **jetson_runtime/** (offline 
 | Tiles / Wayback | `desktop_app/satellite/tiles.py` |
 | Offline maps (MBTiles packages, offline mode flag, region download) | `desktop_app/satellite/offline.py` |
 | Offline Mode menu / dialog | `desktop_app/gui/offline_actions.py`, `desktop_app/gui/offline_dialog.py` |
+| False-target filters (geometry / aux consistency) | `shared/target_filter.py` |
+| Temporal confirm + gate + coast (desktop + Jetson) | `shared/target_stabilizer.py`; config `stabilizer` in `shared/config/__init__.py` |
+| Detection Filters dialog (QSettings → package) | `desktop_app/gui/stabilizer_dialog.py` |
 | Desktop serial (dx/dy during live test) | `desktop_app/gui/serial_actions.py`, `serial_dialog.py`; core `shared/serial_out.py` |
 | Auto pipeline logic | `desktop_app/pipeline/auto.py` |
 | Region atlas record / geo helpers | `desktop_app/atlas/model.py` |
