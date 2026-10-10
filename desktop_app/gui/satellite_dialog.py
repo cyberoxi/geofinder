@@ -24,7 +24,6 @@ from shared.qt_compat import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSettings,
     QSizePolicy,
     QSpinBox,
     QTimer,
@@ -33,7 +32,7 @@ from shared.qt_compat import (
     qt_exec,
 )
 
-_SEL_SETTINGS_KEY = "satellite/last_selection"
+_SEL_FILENAME = "last_selection.json"
 from desktop_app.gui.archive_picker import (
     ArchivePickerDialog,
     EarthdataLoginDialog,
@@ -363,9 +362,9 @@ class SatelliteVideoDialog(QDialog):
         self.map_panel.btn_clear.clicked.connect(self._clear_selection)
         QTimer.singleShot(100, self._restore_selection)
 
-    @staticmethod
-    def _settings() -> QSettings:
-        return QSettings()
+    def _selection_path(self) -> Path:
+        """Per-project selection file under exports/satellite (not global settings)."""
+        return self.out_dir / _SEL_FILENAME
 
     def _persist_selection(self) -> None:
         poly = self.map_panel.map.selection_polygon()
@@ -378,21 +377,31 @@ class SatelliteVideoDialog(QDialog):
             "center_lon": float(m.center_lon),
             "zoom": int(m.zoom),
         }
-        self._settings().setValue(_SEL_SETTINGS_KEY, json.dumps(payload))
+        path = self._selection_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError:
+            pass
 
     def _clear_saved_selection(self) -> None:
-        self._settings().remove(_SEL_SETTINGS_KEY)
+        path = self._selection_path()
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
 
     def _clear_selection(self) -> None:
         self.map_panel.map.clear_selection()
         self._clear_saved_selection()
 
     def _restore_selection(self) -> None:
-        raw = self._settings().value(_SEL_SETTINGS_KEY, "")
-        if not raw:
+        path = self._selection_path()
+        if not path.is_file():
             return
         try:
-            data = json.loads(str(raw))
+            data = json.loads(path.read_text(encoding="utf-8"))
             pts = data.get("polygon") or []
             poly: List[Tuple[float, float]] = [
                 (float(p[0]), float(p[1])) for p in pts if len(p) >= 2
@@ -411,7 +420,7 @@ class SatelliteVideoDialog(QDialog):
                 m.fit_bbox(min(lats), min(lons), max(lats), max(lons))
             m.set_selection_polygon(poly)
             self._sync_selection_label()
-        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        except (TypeError, ValueError, KeyError, OSError, json.JSONDecodeError):
             self._clear_saved_selection()
 
     def _jump(self) -> None:
