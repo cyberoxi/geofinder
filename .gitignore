@@ -9,18 +9,45 @@ dist/
 *.spec
 tools/windows_desktop/geofinder.spec
 logs/*.log
+.DS_Store
+
+# Generated / local project data
 data/output/*
 !data/output/.gitkeep
 data/failed_frames/*
 !data/failed_frames/.gitkeep
 data/projects/*
 !data/projects/.gitkeep
-models/*.pt
-models/*.onnx
-models/*.engine
-*.mp4
-!data/input/sample.mp4
-.DS_Store
-
-# Offline map packages (large .mbtiles)
+data/packages/*
+!data/packages/.gitkeep
 data/offline_maps/*
+!data/offline_maps/.gitkeep
+
+# Satellite tile cache (large; regenerate locally)
+data/satellite_cache/*
+!data/satellite_cache/.gitkeep
+
+# Videos
+*.mp4
+*.avi
+*.mkv
+!data/input/sample.mp4
+
+# Images / rasters (datasets, tiles, atlas renders)
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.webp
+
+# Model weights & engines (anywhere)
+*.pt
+*.onnx
+*.engine
+weights/
+
+# Atlas train runs / packaged weights (keep json/yaml/txt metadata)
+atlases/**/runs/
+atlases/**/packages/
+atlases/**/base_model/

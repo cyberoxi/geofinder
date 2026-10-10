@@ -26,6 +26,24 @@ GRADE_FA = {
     "unknown": "نامشخص",
 }
 
+GRADE_COLOR = {
+    "excellent": "#22c55e",
+    "good": "#84cc16",
+    "fair": "#eab308",
+    "weak": "#ef4444",
+    "unknown": "#94a3b8",
+}
+
+
+@dataclass
+class LearningStatus:
+    """Compact grade line for Training tab / status widgets (no HW probe)."""
+
+    grade: str
+    grade_fa: str
+    headline: str
+    map50: Optional[float] = None
+
 
 @dataclass
 class Tip:
@@ -258,12 +276,11 @@ def _collect_tips(
     return tips, suggested
 
 
-def build_train_advice(
+def _load_train_bundle(
     train: Optional[Dict[str, Any]] = None,
     *,
     runs_dir: Optional[str | Path] = None,
-    hardware: Optional[Dict[str, Any]] = None,
-) -> TrainAdviceReport:
+) -> Tuple[Dict[str, Any], Optional[Path]]:
     train = dict(train or {})
     if not train and runs_dir:
         summary_path = Path(runs_dir) / "train_summary.json"
@@ -275,6 +292,57 @@ def build_train_advice(
         cand = Path(runs_dir) / "train"
         if cand.is_dir():
             results_dir = cand
+    return train, results_dir
+
+
+def _headline_for(
+    grade: str,
+    map50: Optional[float],
+    settings: Dict[str, Any],
+    train: Dict[str, Any],
+) -> str:
+    batch = int(settings.get("batch") or 4)
+    imgsz = int(settings.get("imgsz") or 640)
+    device = str(settings.get("device") or train.get("device") or "?")
+    map_txt = f"{map50:.3f}" if map50 is not None else "—"
+    return (
+        f"رتبه: {GRADE_FA[grade]} · mAP50={map_txt} · "
+        f"دستگاه={device} · epochs={settings.get('epochs', '?')} · "
+        f"batch={batch} · imgsz={imgsz}"
+    )
+
+
+def summarize_learning_status(
+    train: Optional[Dict[str, Any]] = None,
+    *,
+    runs_dir: Optional[str | Path] = None,
+) -> Optional[LearningStatus]:
+    """Grade + headline for Training tab (skips hardware probe and tips)."""
+    train, results_dir = _load_train_bundle(train, runs_dir=runs_dir)
+    if not train and results_dir is None:
+        return None
+    settings = settings_from(train, results_dir)
+    csv_rows, _ = read_results_csv(results_dir) if results_dir else ([], None)
+    metrics_raw = extract_metrics(train, csv_rows)
+    if not metrics_raw and not train.get("best_weights") and results_dir is None:
+        return None
+    map50 = primary_map(metrics_raw)
+    grade = _grade(map50)
+    return LearningStatus(
+        grade=grade,
+        grade_fa=GRADE_FA[grade],
+        headline=_headline_for(grade, map50, settings, train),
+        map50=map50,
+    )
+
+
+def build_train_advice(
+    train: Optional[Dict[str, Any]] = None,
+    *,
+    runs_dir: Optional[str | Path] = None,
+    hardware: Optional[Dict[str, Any]] = None,
+) -> TrainAdviceReport:
+    train, results_dir = _load_train_bundle(train, runs_dir=runs_dir)
 
     hw = hardware or probe_hardware()
     settings = settings_from(train, results_dir)
@@ -293,15 +361,7 @@ def build_train_advice(
         train=train,
         still_improving=still_improving,
     )
-    batch = int(settings.get("batch") or 4)
-    imgsz = int(settings.get("imgsz") or 640)
-    device = str(settings.get("device") or train.get("device") or "?")
-    map_txt = f"{map50:.3f}" if map50 is not None else "—"
-    headline = (
-        f"رتبه: {GRADE_FA[grade]} · mAP50={map_txt} · "
-        f"دستگاه={device} · epochs={settings.get('epochs', '?')} · "
-        f"batch={batch} · imgsz={imgsz}"
-    )
+    headline = _headline_for(grade, map50, settings, train)
     return TrainAdviceReport(
         grade=grade,
         grade_fa=GRADE_FA[grade],

@@ -217,7 +217,8 @@ Train on desktop GPU (8–12 GB VRAM recommended). Build TensorRT **on the Jetso
 ## FAQ / limits
 
 - Engines are JetPack/device specific — rebuild after upgrades.
-- RTSP is stubbed for a future release (file video supported).
+- Jetson input: video file, IMX477 CSI (`nvarguscamerasrc`), or USB webcam (`--source file|imx477|usb`).
+- RTSP is stubbed for a future release.
 - Without a model, runtime initializes from package reference ROI and tracks via Homography/OF.
 - GStreamer may fail on software-encoded MP4; OpenCV fallback is automatic.
 
@@ -227,6 +228,8 @@ Train on desktop GPU (8–12 GB VRAM recommended). Build TensorRT **on the Jetso
 python desktop_app/app.py
 python jetson_runtime/app.py
 python jetson_runtime/app.py --package pkg.zip --video new.mp4 --headless
+python jetson_runtime/app.py --package pkg.zip --source imx477 --headless
+python jetson_runtime/app.py --package pkg.zip --source usb --camera-index 0 --headless
 python app.py desktop   # launcher
 python app.py jetson
 ```

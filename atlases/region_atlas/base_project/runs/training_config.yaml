@@ -1,7 +1,0 @@
-batch: 4
-data: E:\Projects\geofinder\atlases\region_atlas\base_project\datasets\dataset_v1\data.yaml
-device: '0'
-epochs: 60
-imgsz: 640
-model: E:\Projects\geofinder\yolov8n-seg.pt
-model_type: segmentation

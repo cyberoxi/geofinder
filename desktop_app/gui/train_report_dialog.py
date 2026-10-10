@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from desktop_app.training.advice import TrainAdviceReport, build_train_advice
+from desktop_app.training.advice import GRADE_COLOR, TrainAdviceReport, build_train_advice
 from shared.qt_compat import (
     QDialog,
     QDialogButtonBox,
@@ -23,14 +23,6 @@ from shared.qt_compat import (
     Qt,
     qt_exec,
 )
-
-_GRADE_COLOR = {
-    "excellent": "#22c55e",
-    "good": "#84cc16",
-    "fair": "#eab308",
-    "weak": "#ef4444",
-    "unknown": "#94a3b8",
-}
 _PRIO_COLOR = {"high": "#ef4444", "medium": "#eab308", "low": "#64748b"}
 _PRIO_FA = {"high": "مهم", "medium": "متوسط", "low": "کم"}
 
@@ -92,7 +84,7 @@ class TrainReportDialog(QDialog):
             f"{report.grade_fa}  ·  {report.grade.upper()}",
             style=(
                 f"font-size:20px;font-weight:700;"
-                f"color:{_GRADE_COLOR.get(report.grade, '#94a3b8')};"
+                f"color:{GRADE_COLOR.get(report.grade, '#94a3b8')};"
             ),
             wrap=False,
         )

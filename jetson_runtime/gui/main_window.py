@@ -49,7 +49,9 @@ from shared.qt_compat import (
 )
 from shared.video_reader import VideoReader
 from jetson_runtime.gui.serial_dialog import edit_serial_settings, load_serial_settings
+from jetson_runtime.gui.source_dialog import choose_input_source
 from jetson_runtime.runtime.pipeline import run_runtime
+from jetson_runtime.runtime.sources import KIND_FILE, InputSourceSpec, open_input_source
 
 
 class ProcessWorker(QThread):
@@ -58,10 +60,15 @@ class ProcessWorker(QThread):
     finished_ok = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, package: str, video: str, serial_cfg: Optional[dict] = None):
+    def __init__(
+        self,
+        package: str,
+        source_spec: InputSourceSpec,
+        serial_cfg: Optional[dict] = None,
+    ):
         super().__init__()
         self.package = package
-        self.video = video
+        self.source_spec = source_spec
         self.serial_cfg = serial_cfg
         self._stop = False
 
@@ -72,7 +79,7 @@ class ProcessWorker(QThread):
         try:
             result = run_runtime(
                 self.package,
-                self.video,
+                source=self.source_spec,
                 prefer_gstreamer=False,
                 progress_cb=lambda c, t, info: self.progress.emit(c, t, info),
                 frame_cb=lambda fr, info: self.frame_updated.emit(fr, info),
@@ -90,7 +97,7 @@ class JetsonMainWindow(QMainWindow):
         self.setWindowTitle("سامانه تنگسیری")
         self.resize(1280, 800)
         self.package_path: Optional[str] = None
-        self.video_path: Optional[str] = None
+        self.input_spec: Optional[InputSourceSpec] = None
         self.reader: Optional[VideoReader] = None
         self.worker: Optional[ProcessWorker] = None
         self.local_packages_dir = Path.home() / "geofinder_packages"
@@ -112,7 +119,8 @@ class JetsonMainWindow(QMainWindow):
         m = self.menuBar().addMenu("&File")
         m.addAction(self._tb_action("Import Package…", "package", self.import_package))
         m.addAction(self._tb_action("Scan USB…", "usb", self.scan_usb_now))
-        m.addAction(self._tb_action("Open Video…", "open", self.open_video))
+        m.addAction(self._tb_action("Input Source…", "open", self.choose_input))
+        m.addAction(self._tb_action("Open Video File…", "open", self.open_video))
         m.addAction(
             QAction(
                 "Open RTSP…",
@@ -134,7 +142,14 @@ class JetsonMainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self._tb_action("Package", "package", self.import_package, "Import deployment package"))
         tb.addAction(self._tb_action("USB", "usb", self.scan_usb_now, "Scan USB for trained package"))
-        tb.addAction(self._tb_action("Video", "open", self.open_video, "Open video"))
+        tb.addAction(
+            self._tb_action(
+                "Input",
+                "open",
+                self.choose_input,
+                "Video file / IMX477 CSI / USB webcam",
+            )
+        )
         tb.addSeparator()
         tb.addAction(self._tb_action("Run", "run", self.start, "Start processing"))
         tb.addAction(self._tb_action("Stop", "stop_proc", self.stop, "Stop processing"))
@@ -151,7 +166,7 @@ class JetsonMainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         layout.addWidget(split)
 
-        self.view = QLabel("Import a package and open a video")
+        self.view = QLabel("Import a package and choose input source")
         self.view.setAlignment(Qt.AlignCenter)
         self.view.setMinimumSize(640, 360)
         self.view.setStyleSheet(
@@ -178,7 +193,7 @@ class JetsonMainWindow(QMainWindow):
         for text, icon_name, slot in [
             ("Import Package", "package", self.import_package),
             ("Scan USB", "usb", self.scan_usb_now),
-            ("Open Video", "open", self.open_video),
+            ("Input Source", "open", self.choose_input),
             ("Serial settings", "settings", self.open_serial_settings),
             ("Start Processing", "run", self.start),
             ("Stop Processing", "stop_proc", self.stop),
@@ -287,16 +302,31 @@ class JetsonMainWindow(QMainWindow):
         finally:
             self._usb_busy = False
 
+    def _refresh_info_panel(self, *, package_note: str = "") -> None:
+        lines: list[str] = []
+        if self.package_path:
+            lines.append(f"Package:\n{self.package_path}")
+        else:
+            lines.append("No package\nWaiting for USB…")
+        if package_note:
+            lines.append(package_note)
+        if self.input_spec is not None:
+            lines.append(f"\nInput:\n{self.input_spec.label()}")
+            if self.reader and self.input_spec.kind == KIND_FILE:
+                lines.append(f"\n{self.reader.width}x{self.reader.height} @ {self.reader.fps:.1f}")
+            elif self.input_spec.kind != KIND_FILE:
+                lines.append(
+                    f"\nCapture {self.input_spec.width}x{self.input_spec.height}"
+                    f" @ {self.input_spec.fps} fps"
+                )
+        self.info.setText("".join(lines))
+
     def _set_package(self, path: str, *, from_usb: bool = False, source: Optional[Path] = None) -> None:
         self.package_path = path
-        lines = [f"Package:\n{path}"]
+        note = ""
         if from_usb and source is not None:
-            lines.append(f"\nImported from USB:\n{source}")
-            lines.append("\nStatus: transferred")
-        video_line = ""
-        if self.video_path:
-            video_line = f"\nVideo: {self.video_path}"
-        self.info.setText("".join(lines) + video_line)
+            note = f"\nImported from USB:\n{source}\nStatus: transferred"
+        self._refresh_info_panel(package_note=note)
         self.statusBar().showMessage(
             f"{'USB transfer OK' if from_usb else 'Package selected'}: {path}"
         )
@@ -310,19 +340,54 @@ class JetsonMainWindow(QMainWindow):
             return
         self._set_package(path)
 
+    def choose_input(self):
+        spec = choose_input_source(self, initial=self.input_spec)
+        if spec is None:
+            return
+        self._apply_input_spec(spec)
+
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(self, "Video", "", "Videos (*.mp4 *.avi *.mkv *.mov)")
         if not path:
             return
-        self.video_path = path
+        self._apply_input_spec(InputSourceSpec.from_file(path, prefer_gstreamer=False))
+
+    def _apply_input_spec(self, spec: InputSourceSpec) -> None:
         if self.reader:
             self.reader.release()
-        self.reader = VideoReader(path, prefer_gstreamer=False)
-        n = max((self.reader.frame_count or 1) - 1, 0)
-        self.slider.setRange(0, n)
-        self.frame_spin.setRange(0, n)
-        self._seek(0)
-        self.info.setText(self.info.text() + f"\nVideo: {path}\n{self.reader.width}x{self.reader.height} @ {self.reader.fps:.1f}")
+            self.reader = None
+        try:
+            if spec.kind == KIND_FILE:
+                if not spec.path:
+                    raise ValueError("No video path")
+                self.reader = VideoReader(spec.path, prefer_gstreamer=False)
+                n = max((self.reader.frame_count or 1) - 1, 0)
+                self.slider.setEnabled(True)
+                self.frame_spin.setEnabled(True)
+                self.slider.setRange(0, n)
+                self.frame_spin.setRange(0, n)
+                self.input_spec = spec
+                self._seek(0)
+            else:
+                src = open_input_source(spec)
+                try:
+                    ok, frame = src.read()
+                    if not ok or frame is None:
+                        raise RuntimeError(f"No frame from {spec.label()}")
+                    self.slider.setEnabled(False)
+                    self.frame_spin.setEnabled(False)
+                    self.slider.setRange(0, 0)
+                    self.frame_spin.setRange(0, 0)
+                    self.input_spec = spec
+                    self._show(frame)
+                finally:
+                    src.release()
+        except Exception as exc:  # noqa: BLE001
+            self.input_spec = None
+            QMessageBox.critical(self, "Input", str(exc))
+            return
+        self._refresh_info_panel()
+        self.statusBar().showMessage(f"Input ready: {spec.label()}")
 
     def _seek(self, v: int):
         if not self.reader:
@@ -347,27 +412,48 @@ class JetsonMainWindow(QMainWindow):
             self.status.setStyleSheet(f"font-size:18px;font-weight:bold;color:{color};")
 
     def start(self):
-        if not self.package_path or not self.video_path:
-            QMessageBox.warning(self, "Run", "Import package and open video first")
+        if not self.package_path or self.input_spec is None:
+            QMessageBox.warning(
+                self,
+                "Run",
+                "Import package and choose input source first\n"
+                "(video file / IMX477 / USB webcam)",
+            )
             return
+        # Release preview capture so the worker can reopen the same camera.
+        if self.reader:
+            self.reader.release()
+            self.reader = None
         serial_cfg = load_serial_settings()
-        self.worker = ProcessWorker(self.package_path, self.video_path, serial_cfg=serial_cfg)
+        self.worker = ProcessWorker(self.package_path, self.input_spec, serial_cfg=serial_cfg)
         self.worker.frame_updated.connect(lambda fr, info: self._show(fr, info))
         self.worker.progress.connect(self._on_progress)
-        self.worker.finished_ok.connect(lambda r: QMessageBox.information(self, "Done", json.dumps(r.get("paths", {}), indent=2)))
+        self.worker.finished_ok.connect(self._on_finished)
         self.worker.failed.connect(lambda e: QMessageBox.critical(self, "Error", e))
         self.worker.start()
         self.status.setText("PROCESSING")
 
+    def _on_finished(self, result: dict) -> None:
+        QMessageBox.information(self, "Done", json.dumps(result.get("paths", {}), indent=2))
+        # Re-open file preview after a file run
+        if self.input_spec and self.input_spec.kind == KIND_FILE and self.input_spec.path:
+            try:
+                self.reader = VideoReader(self.input_spec.path, prefer_gstreamer=False)
+                self._seek(0)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _on_progress(self, c: int, t: int, info: dict) -> None:
         dx = info.get("offset_dx")
         dy = info.get("offset_dy")
+        live = self.input_spec is not None and self.input_spec.kind != KIND_FILE
+        prog = f"{c}" if live or t <= 0 else f"{c}/{t}"
         if dx is not None and dy is not None:
             self.statusBar().showMessage(
-                f"{c}/{t} {info.get('status')}  offset dx={dx:.0f} dy={dy:.0f}"
+                f"{prog} {info.get('status')}  offset dx={dx:.0f} dy={dy:.0f}"
             )
         else:
-            self.statusBar().showMessage(f"{c}/{t} {info.get('status')}")
+            self.statusBar().showMessage(f"{prog} {info.get('status')}")
 
     def stop(self):
         if self.worker:
@@ -376,7 +462,7 @@ class JetsonMainWindow(QMainWindow):
     def reset(self):
         self.stop()
         self.status.setText("READY")
-        if self.reader:
+        if self.reader and self.input_spec and self.input_spec.kind == KIND_FILE:
             self._seek(0)
 
     def closeEvent(self, e):  # noqa: N802
@@ -390,10 +476,14 @@ class JetsonMainWindow(QMainWindow):
 
 def main():
     setup_logging()
+    from shared.app_icon import apply_app_icon, ensure_windows_app_id
+
+    ensure_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("سامانه تنگسیری")
     apply_theme(app)
     win = JetsonMainWindow()
+    apply_app_icon(app, win)
     win.show()
     return qt_exec(app)
 

@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+import cv2
+import numpy as np
+
 from jetson_runtime.detectors.yolo_detector import YOLODetector
 from jetson_runtime.exporters.result_exporter import ResultExporter, draw_overlay
 from jetson_runtime.package_loader.loader import PackageLoader
@@ -15,32 +18,14 @@ from jetson_runtime.serial_out import (
     image_to_target_offset,
     merge_serial_config,
 )
+from jetson_runtime.runtime.sources import FrameSource, InputSourceSpec, open_input_source
 from shared.logging import get_logger, setup_logging
 from shared.schemas import ROI, RuntimeState
-from shared.video_reader import VideoReader
 
 logger = get_logger("jetson.pipeline")
 
 ProgressCb = Callable[[int, int, dict], None]
 FrameCb = Callable[[Any, dict], None]
-
-
-class FileVideoSource:
-    def __init__(self, path: str, prefer_gstreamer: bool = True):
-        self.reader = VideoReader(path, prefer_gstreamer=prefer_gstreamer)
-
-    def seek(self, idx: int):
-        return self.reader.seek(idx)
-
-    def read(self):
-        return self.reader.read()
-
-    def release(self):
-        self.reader.release()
-
-    @property
-    def info(self):
-        return self.reader.info
 
 
 class RTSPVideoSource:
@@ -120,9 +105,23 @@ def draw_landmarks(frame, yolo: Optional[YOLODetector]) -> None:
                 cv2.putText(frame, "target", tuple(map(int, tip)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
 
+def _resolve_source_spec(
+    video_path: Optional[str],
+    prefer_gstreamer: bool,
+    source: Optional[Any],
+) -> InputSourceSpec:
+    if isinstance(source, InputSourceSpec):
+        return source
+    if isinstance(source, dict):
+        return InputSourceSpec.from_dict(source)
+    if video_path:
+        return InputSourceSpec.from_file(video_path, prefer_gstreamer=prefer_gstreamer)
+    raise ValueError("Provide video_path or source (file / imx477 / usb)")
+
+
 def run_runtime(
     package_path: str,
-    video_path: str,
+    video_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     prefer_gstreamer: bool = False,
     progress_cb: Optional[ProgressCb] = None,
@@ -131,6 +130,7 @@ def run_runtime(
     initial_roi: Optional[ROI] = None,
     end_frame: int = -1,
     serial_override: Optional[Dict[str, Any]] = None,
+    source: Optional[Any] = None,
 ) -> Dict[str, Any]:
     setup_logging()
     loader = PackageLoader(package_path)
@@ -143,24 +143,30 @@ def run_runtime(
         feature_method=loader.manifest.feature_method if loader.manifest else "AKAZE",
     )
 
-    source = FileVideoSource(video_path, prefer_gstreamer=prefer_gstreamer)
-    assert source.info is not None
+    spec = _resolve_source_spec(video_path, prefer_gstreamer, source)
+    frame_source: FrameSource = open_input_source(spec)
+    assert frame_source.info is not None
+    source_label = frame_source.label
+    logger.info("Input source: %s (live=%s)", source_label, frame_source.is_live)
+
     out_dir = Path(output_dir) if output_dir else root / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
     failed_dir = out_dir / "failed_frames"
     exporter = ResultExporter(str(out_dir), str(failed_dir), loader.runtime_config)
     if loader.runtime_config.get("export", {}).get("save_annotated_video", True):
-        exporter.start_video(None, source.info.width, source.info.height, source.info.fps)
+        exporter.start_video(
+            None, frame_source.info.width, frame_source.info.height, frame_source.info.fps
+        )
 
     serial_cfg = merge_serial_config(loader.runtime_config.get("serial"), serial_override)
     serial = SerialOffsetSender(serial_cfg)
     serial.open()
 
-    ok, frame = source.seek(0)
+    ok, frame = frame_source.seek(0) if not frame_source.is_live else frame_source.read()
     if not ok or frame is None:
         serial.close()
-        source.release()
-        raise RuntimeError("Cannot read video")
+        frame_source.release()
+        raise RuntimeError(f"Cannot read frames from {source_label}")
 
     if initial_roi is not None:
         tracker.initialize(frame, initial_roi)
@@ -191,8 +197,14 @@ def run_runtime(
     fps_list = []
     t0 = time.perf_counter()
     idx = 0
-    last = end_frame if end_frame >= 0 else (source.info.frame_count - 1 if source.info.frame_count > 0 else 10**9)
+    if end_frame >= 0:
+        last = end_frame
+    elif frame_source.is_live or frame_source.info.frame_count <= 0:
+        last = 10**9
+    else:
+        last = frame_source.info.frame_count - 1
     tracking_ok = {RuntimeState.TRACKING, RuntimeState.SCALE_CHANGE}
+    progress_total = max(1, last + 1) if last < 10**9 else 0
 
     try:
         while True:
@@ -205,7 +217,9 @@ def run_runtime(
             dt = time.perf_counter() - t_frame
             fps = 1.0 / dt if dt > 0 else 0.0
             fps_list.append(fps)
-            result = tracker.to_frame_result(idx, source.reader.timestamp_of(idx), process_fps=fps)
+            result = tracker.to_frame_result(
+                idx, frame_source.reader.timestamp_of(idx), process_fps=fps
+            )
             exporter.add_result(result)
 
             fh, fw = frame.shape[:2]
@@ -217,6 +231,7 @@ def run_runtime(
             info["offset_dx"] = dx
             info["offset_dy"] = dy
             info["offset_dist"] = dist
+            info["source"] = source_label
             is_tracking = state.status in tracking_ok and state.roi is not None
             serial.send_offset(dx, dy, distance=dist, status=result.status, tracking=is_tracking)
 
@@ -229,7 +244,7 @@ def run_runtime(
                 exporter.save_failed_frame(frame, idx)
             processed += 1
             if progress_cb:
-                progress_cb(processed, max(1, last + 1), info)
+                progress_cb(processed, progress_total or processed, info)
             if frame_cb:
                 frame_cb(annotated, info)
 
@@ -237,7 +252,15 @@ def run_runtime(
             next_idx = idx + step
             if next_idx > last:
                 break
-            ok, frame = source.seek(next_idx)
+            if frame_source.is_live:
+                # Drop intermediate frames when skip_frames > 0
+                ok, frame = False, None
+                for _ in range(step):
+                    ok, frame = frame_source.read()
+                    if not ok or frame is None:
+                        break
+            else:
+                ok, frame = frame_source.seek(next_idx)
             idx = next_idx
             if not ok or frame is None:
                 break
@@ -252,11 +275,12 @@ def run_runtime(
         "elapsed_sec": elapsed,
         "avg_fps": processed / elapsed if elapsed > 0 else 0.0,
         "min_fps": min(fps_list) if fps_list else 0.0,
+        "input": spec.to_dict(),
         "yolo": yolo.get_info() if yolo else {"available": False},
         "package": loader.manifest.to_dict() if loader.manifest else {},
         "serial": {k: serial_cfg[k] for k in ("enabled", "port", "baudrate") if k in serial_cfg},
         "stabilizer": dict(tracker.stabilizer.cfg),
     }
-    paths = exporter.finalize(loader.runtime_config, stats, video_path=video_path)
-    source.release()
+    paths = exporter.finalize(loader.runtime_config, stats, video_path=source_label)
+    frame_source.release()
     return {"paths": paths, "stats": stats, "package_root": str(root)}

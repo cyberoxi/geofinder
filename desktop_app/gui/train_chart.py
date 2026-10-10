@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from desktop_app.training.advice import GRADE_COLOR, LearningStatus
 from shared.qt_compat import (
     QColor,
     QFont,
@@ -224,6 +225,20 @@ class TrainLiveChart(QWidget):
         self.title.setStyleSheet("color:#e2e8f0;font-weight:600;font-size:14px;")
         root.addWidget(self.title)
 
+        self.grade = QLabel("")
+        self.grade.setStyleSheet("color:#94a3b8;font-size:18px;font-weight:700;")
+        self.grade.setWordWrap(True)
+        self.grade.hide()
+        root.addWidget(self.grade)
+
+        self.headline = QLabel("")
+        self.headline.setStyleSheet("color:#94a3b8;")
+        self.headline.setWordWrap(True)
+        self.headline.setLayoutDirection(Qt.RightToLeft)
+        self.headline.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.headline.hide()
+        root.addWidget(self.headline)
+
         self.subtitle = QLabel("Training…")
         self.subtitle.setStyleSheet("color:#94a3b8;")
         self.subtitle.setWordWrap(True)
@@ -254,6 +269,27 @@ class TrainLiveChart(QWidget):
         self._last_metrics = {}
         self.subtitle.setText("Training…")
         self.stats.setText("—")
+        self.clear_learning_status()
+
+    def clear_learning_status(self) -> None:
+        self.grade.hide()
+        self.grade.setText("")
+        self.headline.hide()
+        self.headline.setText("")
+
+    def set_learning_status(self, status: Optional[LearningStatus]) -> None:
+        """Show report-style grade + headline above the live chart."""
+        if status is None:
+            self.clear_learning_status()
+            return
+        color = GRADE_COLOR.get(status.grade, "#94a3b8")
+        self.grade.setText(f"{status.grade_fa}  ·  {status.grade.upper()}")
+        self.grade.setStyleSheet(f"color:{color};font-size:18px;font-weight:700;")
+        self.grade.setLayoutDirection(Qt.RightToLeft)
+        self.grade.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.grade.show()
+        self.headline.setText(status.headline)
+        self.headline.show()
 
     def set_status(self, text: str) -> None:
         if text:

@@ -64,6 +64,7 @@ from desktop_app.gui.atlas_actions import AtlasActionsMixin
 from desktop_app.gui.offline_actions import OfflineActionsMixin
 from desktop_app.gui.serial_actions import SerialActionsMixin
 from desktop_app.gui.training_help import make_setting_label
+from desktop_app.training.advice import GRADE_COLOR, summarize_learning_status
 
 
 class DesktopMainWindow(
@@ -904,6 +905,17 @@ class DesktopMainWindow(
     def _refresh_train_status(self) -> None:
         """Show whether this target is trained; next train replaces the previous model."""
         trained = bool(self.project) and self._has_trained_model()
+        learning = None
+        if trained and self.project:
+            try:
+                learning = summarize_learning_status(runs_dir=self.project.runs_dir)
+            except Exception:  # noqa: BLE001
+                learning = None
+
+        chart = getattr(self, "train_chart", None)
+        if chart is not None and not getattr(self, "_train_chart_armed", False):
+            chart.set_learning_status(learning)
+
         lbl = getattr(self, "train_status", None)
         if lbl is not None:
             style_idle = (
@@ -924,17 +936,31 @@ class DesktopMainWindow(
                 if self.project.meta:
                     name = (self.project.meta.project_name or "").strip()
                 who = f" برای «{name}»" if name else ""
-                # Two lines + padding so the box height is stable in the right panel
+                grade_line = ""
+                if learning is not None:
+                    grade_line = f"{learning.grade_fa} · {learning.grade.upper()}"
+                    if learning.map50 is not None:
+                        grade_line += f" · mAP50={learning.map50:.3f}"
+                    grade_line += "\n"
+                    color = GRADE_COLOR.get(learning.grade, "#5eead4")
+                    style_ok = (
+                        f"color:{color};font-size:12px;padding:10px 10px;"
+                        "background:#0f2a28;border:1px solid #134e4a;border-radius:6px;"
+                    )
                 lbl.setText(
                     f"✓ آموزش انجام شده{who}\n"
+                    f"{grade_line}"
                     "ترین بعدی جایگزین قبلی می‌شود · replaces previous"
                 )
                 lbl.setStyleSheet(style_ok)
-                lbl.setMinimumHeight(72)
-                lbl.setToolTip(
+                lbl.setMinimumHeight(88 if learning is not None else 72)
+                tip = (
                     "A model already exists for this target. "
                     "Train or Run Full Pipeline will overwrite the previous weights."
                 )
+                if learning is not None:
+                    tip = f"{learning.headline}\n\n{tip}"
+                lbl.setToolTip(tip)
             else:
                 lbl.setText("آموزش انجام نشده / Not trained yet")
                 lbl.setStyleSheet(style_idle)
@@ -1216,11 +1242,15 @@ def main():
         except Exception:
             from PyQt5.QtWidgets import QInputDialog as _QID
             qc.QInputDialog = _QID
+    from shared.app_icon import apply_app_icon, ensure_windows_app_id
+
+    ensure_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("سامانه تنگسیری")
     app.setOrganizationName("GeoFinder")
     apply_theme(app)
     win = DesktopMainWindow()
+    apply_app_icon(app, win)
     win.show()
     return qt_exec(app)
 

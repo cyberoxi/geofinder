@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 from typing import Dict
 
 from shared.qt_compat import (
@@ -16,6 +15,9 @@ from shared.qt_compat import (
     Qt,
     qt_exec,
 )
+
+# Force each line RTL even when it starts with Latin (Epochs, GPU, • segmentation, …)
+_RLI, _PDI, _RLM = "\u2067", "\u2069", "\u200f"
 
 HELP: Dict[str, Dict[str, str]] = {
     "model_type": {
@@ -69,7 +71,7 @@ HELP: Dict[str, Dict[str, str]] = {
     "batch": {
         "title": "اندازهٔ دسته (Batch)",
         "body": (
-            "تعداد تصاویری که در هر گام به مدل داده می‌شود.\n\n"
+            "تعداد تصویری که در هر گام به مدل داده می‌شود.\n\n"
             "• Batch بالاتر: معمولاً گرادیان پایدارتر و استفادهٔ بهتر از GPU، "
             "ولی حافظهٔ ویدئویی (VRAM) بیشتری لازم دارد.\n\n"
             "• Batch خیلی بالا: خطای کمبود حافظه (OOM) و توقف آموزش.\n\n"
@@ -107,13 +109,33 @@ HELP: Dict[str, Dict[str, str]] = {
 }
 
 
-def _rtl_html(text: str) -> str:
-    """HTML block that keeps Persian help fully right-aligned (RTL)."""
-    escaped = html.escape(text or "").replace("\n", "<br>")
-    return (
-        '<div dir="rtl" style="text-align:right; direction:rtl;'
-        f'unicode-bidi:embed;">{escaped}</div>'
-    )
+def _force_rtl_text(text: str) -> str:
+    """Prefix every non-empty line so Persian starts on the right edge."""
+    if not text:
+        return text
+    out = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append("")
+            continue
+        if line.startswith(_RLI) or line.startswith(_RLM):
+            out.append(line)
+        else:
+            out.append(f"{_RLM}{_RLI}{line}{_PDI}")
+    return "\n".join(out)
+
+
+def _rtl_label(text: str, *, style: str = "", wrap: bool = True) -> QLabel:
+    lab = QLabel(_force_rtl_text(text))
+    lab.setLayoutDirection(Qt.RightToLeft)
+    # AlignAbsolute: pin to the physical right edge (Persian starts on the right).
+    # Without it, RTL layout + AlignRight can flip and look left-aligned.
+    v = Qt.AlignTop if wrap else Qt.AlignVCenter
+    lab.setAlignment(Qt.AlignRight | Qt.AlignAbsolute | v)
+    lab.setWordWrap(wrap)
+    if style:
+        lab.setStyleSheet(style)
+    return lab
 
 
 def make_setting_label(parent: QWidget, text: str, help_key: str) -> QWidget:
@@ -147,34 +169,29 @@ def show_training_help(parent: QWidget, key: str) -> None:
     dlg = QDialog(parent)
     dlg.setLayoutDirection(Qt.RightToLeft)
     dlg.setWindowTitle(info["title"])
-    dlg.setMinimumWidth(420)
-    dlg.setMaximumWidth(520)
+    dlg.setMinimumWidth(440)
+    dlg.setMaximumWidth(560)
     root = QVBoxLayout(dlg)
     root.setContentsMargins(16, 14, 16, 12)
     root.setSpacing(12)
+    root.setAlignment(Qt.AlignRight | Qt.AlignTop)
 
-    title = QLabel()
-    title.setLayoutDirection(Qt.RightToLeft)
-    title.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    title.setWordWrap(True)
-    title.setTextFormat(Qt.RichText)
-    title.setText(
-        '<div dir="rtl" style="text-align:right;font-weight:700;font-size:14px;'
-        f'color:#e2e8f0;">{html.escape(info["title"])}</div>'
+    title = _rtl_label(
+        info["title"],
+        style="font-weight:700;font-size:14px;color:#e2e8f0;",
+        wrap=False,
     )
     root.addWidget(title)
 
-    body = QLabel()
-    body.setLayoutDirection(Qt.RightToLeft)
-    body.setAlignment(Qt.AlignRight | Qt.AlignTop)
-    body.setWordWrap(True)
-    body.setTextFormat(Qt.RichText)
-    body.setTextInteractionFlags(Qt.TextSelectableByMouse)
-    body.setText(_rtl_html(info["body"]))
-    body.setStyleSheet(
-        "QLabel{color:#cbd5e1;font-size:13px;"
-        "background:#0f172a;border:1px solid #243041;border-radius:8px;padding:12px;}"
+    body = _rtl_label(
+        info["body"],
+        style=(
+            "color:#cbd5e1;font-size:13px;"
+            "background:#0f172a;border:1px solid #243041;border-radius:8px;padding:12px;"
+        ),
     )
+    body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+    body.setMinimumWidth(400)
     root.addWidget(body)
 
     box = QDialogButtonBox(QDialogButtonBox.Ok)

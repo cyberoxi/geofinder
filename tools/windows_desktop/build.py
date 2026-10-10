@@ -82,6 +82,7 @@ def _write_spec() -> None:
     # the PyPI `packaging` package. Modules are collected via Analysis imports.
     datas = [
         (str(ROOT / "config"), "config"),
+        (str(ROOT / "shared" / "assets" / "app.ico"), "shared/assets"),
     ]
     for name in WEIGHT_CANDIDATES:
         src = ROOT / name
@@ -142,6 +143,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=r'{(ROOT / "shared" / "assets" / "app.ico").as_posix()}',
 )
 coll = COLLECT(
     exe,
